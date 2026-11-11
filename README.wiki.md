@@ -1,526 +1,225 @@
 # MEMZ Technical Wiki
 
-This document provides comprehensive technical details about MEMZ's architecture, implementation, and Linux memory subsystem interactions.
-
----
+A detailed breakdown of how `memz` collects kernel telemetry, computes regression metrics, and isolates background workloads from the terminal rendering loop.
 
 ## Table of Contents
 
-1. [Architecture Overview](#architecture-overview)
-2. [Module Breakdown](#module-breakdown)
-3. [Data Flow](#data-flow)
-4. [Linux Memory Subsystem](#linux-memory-subsystem)
-5. [Implementation Details](#implementation-details)
-6. [Design Decisions](#design-decisions)
-7. [Performance Considerations](#performance-considerations)
-8. [Limitations and Trade-offs](#limitations-and-trade-offs)
+1. [Architecture and Concurrency](#architecture-and-concurrency)
+2. [Kernel Data Acquisition](#kernel-data-acquisition)
+3. [Memory Math and Accounting](#memory-math-and-accounting)
+4. [Statistical Leak Detection](#statistical-leak-detection)
+5. [Adaptive Polling Engine](#adaptive-polling-engine)
+6. [Data Pipeline and Table Projections](#data-pipeline-and-table-projections)
+7. [Configuration Storage](#configuration-storage)
+8. [Performance Characteristics](#performance-characteristics)
 
 ---
 
-## Architecture Overview
+## Architecture and Concurrency
 
-MEMZ follows a three-layer architecture:
+`memz` separates raw data extraction from terminal rendering using an asynchronous worker model connected by bounded channels.
 
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                    Terminal Layer (terminal/)                   │
+│                                                                 │
+│   tui.rs  ───► 60 FPS Event Loop (Non-blocking crossterm poll)  │
+│                Keyboard and Mouse Event Router                  │
+│                                                                 │
+│   ui.rs   ───► Ratatui Render Engine                            │
+│                Stateless Frame Generator                        │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │ MPSC Channels
+                                 │ State Rx (sync_channel(1))
+                                 │ Inspect Rx (sync_channel(1))
+                                 │ Command Tx (channel())
+┌────────────────────────────────┴────────────────────────────────┐
+│                        App Layer (app/)                         │
+│                                                                 │
+│   state.rs  ──► Table Navigation, Sort and Group Projections    │
+│                 Baseline Differential Computations              │
+│                                                                 │
+│   config.rs ──► Session State and Theme Storage (XDG / AppData) │
+│                                                                 │
+│   engine.rs ──► Background Worker Controller                    │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │ Thread Handoff
+                                 │ Runtime Commands (Kill, Inspect, Mode)
+                                 │ String Caching with Arc<str>
+┌────────────────────────────────┴────────────────────────────────┐
+│                       Core Layer (core/)                        │
+│                                                                 │
+│   collector.rs ──► Linux procfs Parser and sysinfo Backend      │
+│                    Single-Pass smaps_rollup and NUMA Reader     │
+│                                                                 │
+│   analyzer.rs  ──► Linear Regression Engine                     │
+│                    PSI Pressure Evaluator and dt Normalization  │
+└─────────────────────────────────────────────────────────────────┘
 ```
-+------------------------------------------+
-|         User Interface (ui.rs)           |
-|    TUI rendering, input handling         |
-+------------------------------------------+
-                    |
-                    | AnalyzedState
-                    |
-+------------------------------------------+
-|       Analyzer (analyzer.rs)             |
-|   Aggregation, computation, tracking     |
-+------------------------------------------+
-                    |
-                    | MemorySnapshot
-                    |
-+------------------------------------------+
-|      Collector (collector.rs)            |
-|   /proc parsing, raw data extraction     |
-+------------------------------------------+
-                    |
-                    |
-              Linux procfs
-```
 
-**Separation of Concerns**:
-- `collector`: Raw data acquisition from kernel
-- `analyzer`: Computation and state management
-- `ui`: Presentation and user interaction
+### Threading Model
 
-This design allows independent testing and modification of each layer.
+1. **Terminal Render Loop (Main Thread)**
+   - Listens for terminal events using `crossterm::event::poll` with a 16ms timeout (targetting 60 FPS).
+   - Only runs full layout redraws when new telemetry data arrives or when the user interacts with the keyboard or mouse.
+   - Never performs blocking file I/O or procfs reads directly on the main thread.
+
+2. **Telemetry Engine (Worker Thread)**
+   - Runs in a background OS thread spawned during initialization.
+   - Periodically walks procfs, computes NUMA usage, and executes leak detection math.
+   - Passes fresh `AnalyzedState` frames via a bounded `sync_channel(1)`. If the main thread is busy drawing, older frames are dropped automatically to prevent stale telemetry buildup.
+   - Listens for incoming commands (`Kill`, `Inspect`, `SetTickMode`, `Shutdown`) on an unbounded control channel.
+
+3. **String Allocation Strategy**
+   - Process names and command lines are wrapped in `Arc<str>`.
+   - Repeated sampling loops reuse the existing heap pointer for known processes, preventing thousands of tiny string allocations each second.
 
 ---
 
-## Module Breakdown
+## Kernel Data Acquisition
 
-### collector.rs
+### Procfs Interfaces
 
-**Purpose**: Extract raw memory data from Linux procfs.
+`memz` gathers memory metrics through several standard Linux virtual files:
 
-**Key Structures**:
-
-- `MemorySnapshot`: Container for system, process, and NUMA data at a single point in time
-- `ProcessMemory`: Per-process memory statistics from `smaps_rollup`
-- `SystemMemory`: System-wide statistics from `/proc/meminfo`
-- `NumaNode`: Per-node memory data from `/sys/devices/system/node/nodeN/meminfo`
-
-**Data Sources**:
-
-1. `/proc/meminfo`: System totals (MemTotal, MemFree, Cached, etc.)
-2. `/proc/[pid]/smaps_rollup`: Aggregated per-process memory maps
-3. `/proc/[pid]/comm`: Process names
-4. `/sys/devices/system/node/nodeN/meminfo`: NUMA topology
-
-**Why smaps_rollup?**
-
-Traditional `/proc/[pid]/smaps` provides detailed per-VMA (Virtual Memory Area) breakdowns but requires parsing potentially thousands of lines per process. `smaps_rollup` (kernel 4.14+) provides the same aggregated data in ~10 lines, reducing I/O and parsing overhead by 100-1000x.
-
-**Collection Strategy**:
-
-- Single pass through `/proc` to enumerate PIDs
-- Parallel reads would help on systems with 1000+ processes, but current implementation is sequential for simplicity
-- Failed reads (process died mid-collection) are silently ignored
-- PID tracking in `known_pids` enables future delta calculations (currently unused)
-
-### analyzer.rs
-
-**Purpose**: Transform raw snapshots into actionable statistics.
-
-**Key Structures**:
-
-- `AnalyzedState`: Final output combining all computed metrics
-- `ProcessStats`: Per-process aggregations with deltas
-- `SystemStats`: System-level totals and utilization
-- `SharedMemoryStats`: Sharing efficiency analysis
-- `MemoryMap`: Physical memory distribution breakdown
-
-**Computations**:
-
-1. **Process Analysis** (`analyze_processes`):
-   - Aggregates `shared_clean + shared_dirty` into `shared_kb`
-   - Aggregates `private_clean + private_dirty` into `private_kb`
-   - Calculates PSS delta by comparing current snapshot with `process_history`
-   - Delta enables trend detection (memory growth/shrinkage)
-
-2. **System Analysis** (`analyze_system`):
-   - Sums all process PSS values to get `total_process_pss_kb`
-   - Sums all process RSS values to get `total_process_rss_kb`
-   - Computes swap usage: `swap_total - swap_free`
-   - Provides both used and available memory metrics
-
-3. **Shared Memory Analysis** (`analyze_shared_memory`):
-   - Sums shared clean/dirty across all processes
-   - Calculates sharing efficiency: `(RSS_total - PSS_total) / RSS_total * 100`
-   - High efficiency (>30%) indicates effective memory sharing (common in systems with many processes using shared libraries)
-
-4. **Memory Map** (`build_memory_map`):
-   - Accounts for process private, cache, buffers, free, slab, page tables
-   - Kernel memory calculated as residual: `total - accounted`
-   - This approximation is necessary because procfs doesn't expose detailed kernel allocations
-
-**State Management**:
-
-- `last_snapshot`: Stores previous collection for delta calculation
-- `process_history`: HashMap tracking PSS values by PID across collections
-- History is pruned to current PIDs each cycle to avoid unbounded growth
-
-### ui.rs
-
-**Purpose**: Render TUI and handle user input.
-
-**Framework**: ratatui (formerly tui-rs)
-
-**Key Structures**:
-
-- `App`: Application state container
-  - Current `AnalyzedState`
-  - Sort mode (PSS, RSS, Shared, PID)
-  - View mode (Processes, Memory Map, Shared Memory)
-  - Scroll offset for process list navigation
-
-**Rendering Pipeline**:
-
-1. `draw()`: Main entry point, splits screen into three chunks
-2. `draw_system_stats()`: Top panel with system overview
-3. View-specific renderers:
-   - `draw_process_list()`: Scrollable table with process data
-   - `draw_memory_map()`: Bar chart of memory distribution
-   - `draw_shared_view()`: Shared memory statistics
-4. `draw_help()`: Bottom panel with keybindings
-
-**Sorting**:
-
-Processes are re-sorted on every data update according to `sort_mode`:
-- PSS (default): Largest memory consumers first
-- RSS: Traditional RSS-based sorting
-- Shared: Processes with most shared memory
-- PID: Numerical order
-
-**Scrolling**:
-
-- `visible_rows` calculated dynamically from terminal height
-- Scroll bounds enforced to prevent out-of-range access
-- Page up/down jumps by `visible_rows`
-
-**Color Scheme**:
-
-- `COLOR_PRIMARY` (white): General data
-- `COLOR_SECONDARY` (yellow): Labels and emphasis
-- Bold styling for processes with significant PSS deltas (>10 MB change)
-
-### main.rs
-
-**Purpose**: Application entry point, event loop, and system checks.
-
-**Responsibilities**:
-
-1. **Platform Validation**:
-   - Compile-time check: `#[cfg(target_os = "linux")]`
-   - Runtime check: `is_root()` using `libc::geteuid()`
-   - Kernel version parsing from `/proc/sys/kernel/osrelease`
-
-2. **Terminal Setup**:
-   - Enable raw mode (disable line buffering, echo)
-   - Switch to alternate screen (preserves existing terminal content)
-   - Enable mouse capture (currently unused)
-
-3. **Event Loop**:
-   - Poll for keyboard input with timeout
-   - Refresh data every 1 second (`tick_rate`)
-   - Handle quit, sort, view, scroll events
-   - Redraw on every iteration
-
-4. **Cleanup**:
-   - Restore terminal state on exit (disable raw mode, leave alternate screen)
-   - Show cursor (hidden during runtime)
-   - Print errors to stderr after terminal restoration
-
-**Error Handling**:
-
-Errors propagated via `anyhow::Result`. All errors trigger cleanup before exit.
+- **`/proc/meminfo`**: Used for overall system metrics (such as `MemTotal`, `MemFree`, `MemAvailable`, `Cached`, `Buffers`, `Slab`, `PageTables`, `SwapTotal`, and `SwapFree`).
+- **`/proc/[pid]/smaps_rollup`**: Provides aggregated memory counters for a process in roughly ten lines of text. Using `smaps_rollup` instead of parsing thousands of lines in `/proc/[pid]/smaps` reduces file I/O overhead by two to three orders of magnitude.
+- **`/proc/[pid]/smaps`**: Read only when you select a process and hit `Enter`. This extracts category details (heap, stack, anonymous memory, and dynamic libraries).
+- **`/proc/pressure/memory`**: Kernel Pressure Stall Information (PSI). Evaluates `avg10` numbers for both `some` (at least one process delayed by memory reclaim) and `full` (all runnable threads stalled waiting for memory).
+- **`/sys/devices/system/node/node[N]/meminfo`**: Gathers hardware NUMA node capacities and usage figures.
 
 ---
 
-## Data Flow
+## Memory Math and Accounting
 
-### Initialization
+### PSS vs RSS
 
+Resident Set Size (RSS) simply adds together all physical pages mapped into a process:
+
+$$\text{RSS}_i = \text{Private Pages}_i + \sum_{j \in \text{Shared}_i} 1$$
+
+When $N$ processes map a shared library (such as `glibc`), standard RSS counts that library $N$ times. As a result, summing RSS across all tasks frequently exceeds total physical RAM:
+
+$$\sum_{i=1}^{M} \text{RSS}_i \gg \text{Total System Memory}$$
+
+Proportional Set Size (PSS) corrects for this by dividing shared pages among all processes holding an active reference:
+
+$$\text{PSS}_i = \text{Private Pages}_i + \sum_{j \in \text{Shared}_i} \frac{1}{\text{Ref Count}_j}$$
+
+$$\sum_{i=1}^{M} \text{PSS}_i \approx \text{Real Process RAM Usage}$$
+
+### Calculating Kernel Memory Residuals
+
+Linux does not provide a single counter for total kernel memory allocations. `memz` estimates kernel space by subtracting accounted user and system structures from total RAM:
+
+$$\text{Kernel}_{\text{KB}} = \text{MemTotal} - \left( \text{Private} + \text{Shared} + \text{Cached} + \text{Buffers} + \text{Slab} + \text{PageTables} + \text{Free} \right)$$
+
+This residual approximation covers in-kernel structures, DMA buffers, network socket queues, and device driver allocations.
+
+---
+
+## Statistical Leak Detection
+
+Instead of watching for small step increases that could just be regular heap fragmentation, `memz` evaluates the slope of a rolling sample history ($n \ge 8$) using Ordinary Least Squares (OLS) regression.
+
+### Regression Math
+
+Given sample points $(t_i, y_i)$ where $t_i = i$ and $y_i = \text{PSS}_i$:
+
+$$\bar{t} = \frac{n - 1}{2}, \quad \bar{y} = \frac{1}{n} \sum_{i=0}^{n-1} y_i$$
+
+$$\text{Cov}(t, y) = \sum_{i=0}^{n-1} (t_i - \bar{t})(y_i - \bar{y})$$
+
+$$\text{Var}(t) = \sum_{i=0}^{n-1} (t_i - \bar{t})^2, \quad \text{Var}(y) = \sum_{i=0}^{n-1} (y_i - \bar{y})^2$$
+
+The growth slope ($m_{\text{sample}}$) and fit quality ($R^2$) are:
+
+$$m_{\text{sample}} = \frac{\text{Cov}(t, y)}{\text{Var}(t)}, \quad R^2 = \frac{[\text{Cov}(t, y)]^2}{\text{Var}(t) \cdot \text{Var}(y)}$$
+
+### Normalizing for Real Elapsed Time
+
+Because the sampling rate can speed up or slow down based on system activity, the raw sample slope is normalized against the actual elapsed time ($\Delta t$):
+
+$$\text{Rate}_{\text{growth}} = \frac{m_{\text{sample}}}{\Delta t_{\text{actual}}} \quad [\text{KB/s}]$$
+
+### Trigger Conditions
+
+A process is marked with a red `[LEAK?]` tag only when all four checks pass:
+1. At least 8 continuous samples are on record.
+2. The normalized growth rate is at least $32\text{ KB/s}$.
+3. Linear correlation $R^2$ is $0.70$ or higher.
+4. Temporary downward dips do not exceed one third of the overall growth span.
+
+---
+
+## Adaptive Polling Engine
+
+`memz` automatically adjusts how often it queries the kernel based on memory pressure:
+
+| Mode | Polling Interval | Why It Switches |
+| :--- | :--- | :--- |
+| **Eco** | $2000\text{ ms}$ | Normal conditions, no thrashing, healthy PSI indicators, and no leaks. |
+| **Normal** | $1000\text{ ms}$ | User has a process inspector popup open. |
+| **Fast** | $500\text{ ms}$ | Memory thrashing ($\ge 4\text{ MiB/s}$ swap delta), PSI $\text{full} \ge 1.0\%$, free RAM $< 15\%$, or active leak detected. |
+
+You can use `+` or `-` to manually lock the engine into Fast, Normal, or Eco speeds, or return it to Auto.
+
+---
+
+## Data Pipeline and Table Projections
+
+Data travels through a multi-stage pipeline before reaching the screen:
+
+```text
+Kernel procfs / sysinfo
+         │
+         ▼
+AnalyzedState (ProcessStats[])
+         │
+         ├─► Substring Search (matching name or PID)
+         │
+         ├─► Process Grouping (combining matching binary names)
+         │
+         ├─► Snapshot Differentials (relative to saved baseline)
+         │
+         ▼
+DisplayRow[] (Projected Table Model)
+         │
+         ▼
+Ratatui Table Rendering (viewport offset and selection)
 ```
-main()
-  -> check_system_requirements()
-  -> setup_terminal()
-  -> Collector::new()
-  -> Analyzer::new()
-  -> App::new()
-  -> initial collection
-```
 
-### Runtime Loop (every 1 second)
+### Process Grouping Details
 
-```
-collector.collect()
-  -> parse /proc/meminfo
-  -> parse /sys/devices/system/node/*/meminfo
-  -> enumerate /proc/[pid] directories
-  -> parse /proc/[pid]/smaps_rollup for each PID
-  -> return MemorySnapshot
+When grouping (`g`) is switched on:
+- All processes sharing the same binary name are grouped into a single row.
+- PSS, RSS, Shared, Private, and Swap counters are added together.
+- Individual history buffers are merged chronologically to allow leak detection across the entire group.
+- The PID column shows the count of running instances (for example, `12x`).
 
-analyzer.update(snapshot)
-  -> store snapshot
+---
 
-analyzer.get_state()
-  -> analyze_processes() -> ProcessStats[]
-  -> analyze_system() -> SystemStats
-  -> analyze_shared_memory() -> SharedMemoryStats
-  -> build_memory_map() -> MemoryMap
-  -> return AnalyzedState
+## Configuration Storage
 
-app.update_data(state)
-  -> sort processes by current mode
-  -> store state
+Preferences are loaded at startup and saved upon exit using a simple key-value file without pulling in heavy serialization crates:
 
-terminal.draw()
-  -> ui::draw() -> renders all panels
+- **Linux and macOS**: `$XDG_CONFIG_HOME/memz/state.conf` (falls back to `~/.config/memz/state.conf`).
+- **Windows**: `%APPDATA%\memz\state.conf` (falls back to `%USERPROFILE%\.config\memz\state.conf`).
+
+Stored format:
+```ini
+theme=ember_orange
+view_mode=processes
+sort_mode=pss
+tick_mode=auto
+grouped=false
 ```
 
 ---
 
-## Linux Memory Subsystem
-
-Understanding MEMZ requires knowledge of Linux memory management.
-
-### Virtual Memory Areas (VMAs)
-
-Each process has a set of VMAs representing memory regions (code, data, heap, stack, mmap'd files, shared libraries). The kernel tracks per-VMA statistics in `/proc/[pid]/smaps`.
-
-### Page Categories
-
-Pages in a VMA are classified as:
-
-- **Private Clean**: Unmodified pages unique to the process (e.g., unused heap pages)
-- **Private Dirty**: Modified pages unique to the process (e.g., stack, active heap)
-- **Shared Clean**: Unmodified pages shared between processes (e.g., libc code)
-- **Shared Dirty**: Modified pages shared between processes (e.g., System V shared memory)
-
-### RSS vs PSS
-
-**RSS**: Sum of all pages in physical memory for a process. Shared pages are fully counted for each process.
-
-**PSS**: Adjusts for sharing. If a page is shared by N processes, each accounts for 1/N of that page.
-
-Example:
-- Process A: 100 MB private + 50 MB shared (shared by 2 processes)
-- Process B: 200 MB private + 50 MB shared (same 50 MB)
-
-RSS: A=150 MB, B=250 MB, Total=400 MB
-PSS: A=125 MB, B=225 MB, Total=350 MB (matches physical usage)
-
-### Kernel Memory
-
-Not tracked in procfs at per-process granularity. MEMZ estimates kernel memory as:
-
-```
-kernel_kb = total_kb - (process_private + cache + buffers + free + slab + page_tables)
-```
-
-This includes:
-- Kernel code/data
-- DMA buffers
-- Network buffers
-- Unaccounted allocations
-
-### Swap
-
-Linux can swap anonymous pages (heap, stack) to disk. `Swap:` in `smaps_rollup` shows swapped-out memory for each process. Note: file-backed pages (mapped files) are not "swapped" - they're simply discarded and re-read on access.
-
-### NUMA
-
-On multi-socket systems, memory is divided across NUMA nodes. Each CPU socket has local memory. Accessing remote memory incurs latency penalty. MEMZ reads per-node statistics but doesn't track per-process NUMA affinity (would require parsing `/proc/[pid]/numa_maps`).
-
----
-
-## Implementation Details
-
-### PSS Delta Calculation
-
-```rust
-let last_pss = self.process_history.get(&proc.pid).copied().unwrap_or(proc.pss_kb);
-let pss_delta = proc.pss_kb as i64 - last_pss as i64;
-```
-
-- On first observation, `unwrap_or` defaults to current PSS, resulting in delta = 0
-- On subsequent observations, calculates change since last snapshot
-- Negative deltas indicate memory release
-- Large deltas (>10 MB) are highlighted in the UI
-
-### Sharing Efficiency
-
-```rust
-let efficiency = ((total_rss - total_pss) as f64 / total_rss as f64) * 100.0;
-```
-
-Represents percentage of memory saved by sharing. Example:
-- RSS total: 10 GB
-- PSS total: 7 GB
-- Efficiency: 30% (3 GB saved via sharing)
-
-Typical values:
-- Desktop: 20-40% (many processes use shared libraries)
-- Server: 10-25% (depends on workload)
-- Container: 5-15% (isolated environments reduce sharing)
-
-### Memory Map Accounting
-
-Residual calculation assumes all non-explicitly-accounted memory belongs to the kernel. This is a simplification - some memory may be in categories not exposed by procfs.
-
-Known gaps:
-- Hardware-reserved memory
-- BIOS/UEFI regions
-- Memory-mapped I/O
-- GPU memory (on integrated graphics)
-
-For most workloads, these are <1% of total memory.
-
----
-
-## Design Decisions
-
-### Why Rust?
-
-1. Memory safety without garbage collection overhead
-2. Excellent libraries for terminal UI (ratatui) and error handling (anyhow)
-3. Zero-cost abstractions for efficient parsing
-4. Compile-time platform checks
-
-### Why smaps_rollup?
-
-As mentioned, 100-1000x faster than parsing full smaps. Critical for systems with many processes.
-
-### Why 1-second refresh?
-
-Balance between responsiveness and CPU overhead. Faster refresh (e.g., 100ms) would consume more CPU parsing procfs. Slower refresh reduces UX quality.
-
-### Why terminal UI?
-
-- SSH-friendly (works over remote connections)
-- Low resource usage (no GUI overhead)
-- Traditional for system monitoring tools (htop, top, iotop)
-
-### Why no historical graphing?
-
-Would require:
-1. Storing time-series data in memory or on disk
-2. More complex UI (charts, zoom controls)
-3. Increased memory footprint
-
-Out of scope for an academic project focused on real-time analysis.
-
----
-
-## Performance Considerations
-
-### Collection Overhead
-
-On a system with 300 processes:
-- `/proc/meminfo`: ~1ms
-- NUMA nodes: ~2ms
-- Process enumeration: ~5ms
-- smaps_rollup parsing: ~30ms (300 x 0.1ms)
-
-Total: ~38ms per collection
-
-### Memory Overhead
-
-- Base application: ~3 MB
-- Per-process tracking: ~200 bytes per PID
-- Snapshot storage: ~(N_procs x 200 bytes) x 2 (current + history)
-
-For 1000 processes: ~3.4 MB total overhead
-
-### Terminal Rendering
-
-Ratatui uses double-buffering to minimize screen updates. Only changed cells are redrawn. Typical render time: <5ms.
-
-### Scaling Limits
-
-- **Process count**: Tested up to 2000 processes; collection time ~100ms
-- **NUMA nodes**: No practical limit (read scales linearly)
-- **Terminal size**: Works down to 80x24; optimal at 120x30+
-
----
-
-## Limitations and Trade-offs
-
-### Accuracy
-
-- PSS is a kernel estimate, not exact accounting
-- Kernel memory calculation is residual-based approximation
-- Race conditions: processes can start/exit during collection (handled gracefully)
-
-### Completeness
-
-- Doesn't track:
-  - Per-process NUMA placement
-  - Transparent huge pages details
-  - Memory-mapped files attribution
-  - Cgroup memory limits
-
-- These would require additional procfs parsing and UI complexity
-
-### Security
-
-- Requires root for full system visibility
-- No authentication/authorization layer
-- Assumes trusted user environment
-
-For production use, would need:
-- Capability-based access (CAP_SYS_PTRACE instead of full root)
-- Audit logging
-- Read-only mode
-
-### Portability
-
-Linux-only by design. Porting to other Unix-like systems would require:
-- FreeBSD: Parse `/usr/bin/procstat -v` output
-- macOS: Use `task_info()` system calls
-- Windows: WMI queries or PerfMon APIs
-
-Each has different memory models and APIs - non-trivial effort.
-
----
-
-## Future Enhancements
-
-Potential improvements (not implemented):
-
-1. **Per-cgroup accounting**: Track memory usage by container/cgroup
-2. **Historical data**: Store snapshots to file, graph trends
-3. **Filtering**: Show only processes matching name pattern
-4. **Diff mode**: Compare two snapshots (e.g., before/after workload)
-5. **Export**: CSV/JSON output for external analysis
-6. **Alerting**: Threshold-based notifications (e.g., swap usage > 80%)
-7. **Flame graphs**: Visualize memory hierarchy
-
----
-
-## References
-
-- Linux kernel documentation: /proc/[pid]/smaps
-- Understanding Linux memory statistics (kernel.org)
-- PSS vs RSS explanation (LWN.net)
-- NUMA architecture documentation
-- ratatui framework documentation
-
----
-
-## Glossary
-
-- **VMA**: Virtual Memory Area, a contiguous range of virtual addresses
-- **RSS**: Resident Set Size, total physical memory used by a process
-- **PSS**: Proportional Set Size, RSS adjusted for shared pages
-- **smaps**: Per-VMA memory statistics
-- **smaps_rollup**: Aggregated smaps data (kernel 4.14+)
-- **NUMA**: Non-Uniform Memory Access, multi-socket memory topology
-- **procfs**: Pseudo-filesystem exposing kernel/process information
-- **Slab**: Kernel memory allocator cache
-- **Page tables**: Kernel structures mapping virtual to physical addresses
-
----
-
-## Development Notes
-
-### Testing
-
-Manual testing on various distributions:
-- Ubuntu 22.04 (kernel 5.15)
-- Fedora 38 (kernel 6.2)
-- Debian 12 (kernel 6.1)
-
-Automated testing would require:
-- Mock procfs structures
-- Integration tests with known process states
-- Benchmarking on systems with 100-10000 processes
-
-### Code Style
-
-Follows Rust standard conventions:
-- `rustfmt` for formatting
-- `clippy` lints enabled
-- Descriptive variable names where clarity matters
-- Terse names (`proc`, `mem`, `pct`) for hot loops
-
-### Dependencies
-
-- `ratatui 0.20+`: TUI framework
-- `crossterm 0.26+`: Terminal manipulation
-- `anyhow 1.0+`: Error handling
-- `libc 0.2+`: System call wrappers
-
-No unsafe code except `libc::geteuid()` call (required for root check).
-
----
-
-This wiki aims to provide sufficient depth for understanding MEMZ's implementation without requiring prior kernel internals knowledge. For specific questions or clarifications, refer to inline code comments or Linux kernel documentation.
+## Performance Characteristics
+
+- **CPU Utilization**: Stays under $0.8\%$ of a single core on modern systems at 1-second polling intervals with 500 active processes.
+- **Resident Memory**: Takes up between $4.5\text{ MiB}$ and $8.5\text{ MiB}$ of RAM.
+- **Kernel I/O Speed**: Sequential reads of `/proc/[pid]/smaps_rollup` generally finish within $15\text{ to }30\text{ ms}$ per cycle.
+- **Terminal Rendering**: Uses Ratatui double-buffering to write only changed screen cells, completing frame draws in less than $2\text{ ms}$.

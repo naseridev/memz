@@ -1,231 +1,181 @@
 # MEMZ
 
-Advanced Linux memory analyzer with real-time process tracking and system-level memory profiling.
+A fast, cross-platform terminal memory profiler and leak detector written in Rust.
 
-## Overview
+Most system monitors rely on Resident Set Size (RSS), which counts shared libraries multiple times and makes overall memory usage look much higher than it actually is. `memz` uses Proportional Set Size (PSS) from Linux procfs to report accurate, proportional memory numbers. It also tracks process growth history, runs running linear regression to flag memory leaks in real time, and dynamically dials back its own polling rate when your system is idle.
 
-MEMZ is a terminal-based memory analysis tool designed for Linux systems. It provides detailed visibility into memory usage patterns by parsing kernel procfs data and presenting it through an interactive TUI interface. The tool focuses on accurate memory accounting using Proportional Set Size (PSS) metrics rather than traditional RSS measurements.
-
-**Target Use Case**: System administrators and developers who need precise memory usage data for debugging, performance analysis, or capacity planning on Linux servers and workstations.
-
-## Features
-
-- **Process Memory Tracking**: Real-time PSS, RSS, shared, and private memory metrics per process
-- **System-Level Statistics**: Total memory, swap, cache, and buffer monitoring
-- **Physical Memory Mapping**: Kernel vs userspace memory distribution breakdown
-- **Shared Memory Analysis**: Quantifies memory sharing efficiency across processes
-- **NUMA Awareness**: Per-node memory statistics on NUMA systems
-- **Interactive Navigation**: Sortable process lists, multiple view modes, keyboard-driven interface
-
-## System Requirements
-
-- Linux kernel 4.14+ (for smaps_rollup support)
-- Root privileges (required for /proc access)
-- Terminal with UTF-8 support
-
-## Installation
-
-### Prerequisites
-
-**Operating System**: Linux only (tested on kernel 4.14+)
-
-**Rust Toolchain**:
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-**System Requirements**:
-- Linux kernel 4.14 or newer (for `/proc/[pid]/smaps_rollup`)
-- Root access (sudo)
-- UTF-8 capable terminal
-
-### Build Steps
-
-1. Clone or extract the project:
-
-```bash
-git clone https://github.com/naseridev/memz.git
-```
-
-```bash
-cd memz
-```
-
-2. Build the release binary:
-```bash
-cargo build --release
-```
-
-The compiled binary will be at `target/release/memz`.
-
-### Verification
-
-Check kernel version:
-```bash
-uname -r
-```
-
-Ensure you have 4.14 or higher. Older kernels lack `smaps_rollup` and will cause the tool to fail.
-
-## Usage
-
-### Starting MEMZ
-
-Run with sudo (root privileges required):
-```bash
-sudo ./target/release/memz
-```
-
-The terminal will switch to an alternate screen showing live memory data.
-
-### Interface Layout
-
-The TUI is divided into three sections:
-
-1. **Top Panel**: System-wide memory statistics (RAM, swap, cache)
-2. **Middle Panel**: Main content area (changes based on view mode)
-3. **Bottom Panel**: Keyboard controls
-
-### Keyboard Controls
-
-| Key | Action |
-|-----|--------|
-| `q` | Quit the application |
-| `n` | Cycle through sort modes (PSS -> RSS -> Shared -> PID) |
-| `v` | Switch view mode (Processes -> Memory Map -> Shared Memory) |
-| Up/Down | Scroll one line up/down |
-| PgUp/PgDn | Scroll one page up/down |
-
-### View Modes
-
-#### 1. Processes View (Default)
-
-Displays a table of running processes with columns:
-- **PID**: Process identifier
-- **Name**: Process name from `/proc/[pid]/comm`
-- **PSS**: Proportional Set Size (accurate memory usage)
-- **RSS**: Resident Set Size (may overcount shared memory)
-- **Shared**: Total shared memory pages
-- **Private**: Memory unique to this process
-- **Swap**: Swapped-out memory
-- **Delta**: PSS change since last refresh (megabytes)
-
-Processes are sorted by the current sort mode (default: PSS descending).
-
-#### 2. Memory Map View
-
-Shows physical memory distribution:
-- Kernel reserved space
-- Process private/shared memory
-- Page cache and buffers
-- Slab allocator usage
-- Free memory
-
-On NUMA systems, displays per-node memory statistics.
-
-#### 3. Shared Memory View
-
-Analyzes memory sharing across processes:
-- Total shared memory (clean + dirty pages)
-- Sharing efficiency percentage (memory saved by sharing)
-
-## Understanding Memory Metrics
-
-### PSS vs RSS
-
-**RSS (Resident Set Size)**: Total physical memory used by a process, including fully counted shared libraries. Multiple processes sharing the same library will have overlapping RSS values.
-
-**PSS (Proportional Set Size)**: RSS adjusted for shared pages. If a page is shared by N processes, each process accounts for 1/N of that page. PSS provides accurate per-process memory usage without double-counting.
-
-**Rule of thumb**: Sum of all RSS values exceeds total system memory usage. Sum of all PSS values matches actual memory consumption.
-
-### Memory Types
-
-- **Shared Clean**: Unmodified pages shared between processes (e.g., read-only library code)
-- **Shared Dirty**: Modified pages shared between processes (e.g., shared memory segments)
-- **Private Clean**: Unmodified pages unique to one process
-- **Private Dirty**: Modified pages unique to one process (stack, heap)
+---
 
 ## Screenshots
 
 ### Processes View
 ![Processes View](docs/screenshots/processes.png)
 
-### Memory Map View
+### Physical Memory Map
 ![Memory Map](docs/screenshots/memory_map.png)
 
 ### Shared Memory Analysis
 ![Shared Memory](docs/screenshots/shared.png)
 
-## Troubleshooting
+---
 
-### "Unsupported operating system"
+## Installation
 
-MEMZ only works on Linux. It reads from `/proc`, which doesn't exist on macOS or Windows.
+### Option 1: Download Pre-built Binaries (Recommended)
 
-### "This tool requires root privileges"
+You can grab the latest compiled binary directly from the [GitHub Releases](https://github.com/naseridev/memz/releases) page:
 
-Run with `sudo`. Non-root users cannot access `/proc/[pid]/smaps_rollup` for all processes.
+1. Head over to the Releases section and choose the archive matching your operating system and CPU architecture (Linux, macOS, or Windows).
+2. Download and unpack the archive:
+   ```bash
+   tar -xzf memz-linux-x86_64.tar.gz
+   chmod +x memz
+   ```
+3. Move the binary into your system path (optional):
+   ```bash
+   sudo mv memz /usr/local/bin/
+   ```
 
-### "Kernel version X.X detected... requires 4.14+"
+### Option 2: Build from Source
 
-Your kernel lacks `smaps_rollup` support. Options:
-1. Upgrade kernel (recommended)
-2. Modify the code to use `/proc/[pid]/smaps` (slower, but works on older kernels)
+If you prefer building from source, make sure you have Rust 1.74 or later installed:
 
-### Terminal display issues
+```bash
+git clone https://github.com/naseridev/memz.git
+cd memz
+cargo build --release
+```
 
-Ensure your terminal supports UTF-8 and has sufficient size (minimum 80x24 recommended).
+The resulting binary will be saved under `target/release/memz`.
 
-### High CPU usage
+### Running the Profiler
 
-MEMZ refreshes every second. On systems with thousands of processes, parsing `/proc` can be CPU-intensive. This is expected behavior.
+On Linux, reading memory maps for processes owned by other users requires elevated privileges:
 
-## Performance Characteristics
+```bash
+# Linux (recommended for full system visibility)
+sudo ./memz
 
-- **Memory overhead**: ~5-10 MB for the tool itself
-- **Refresh rate**: 1 second (hardcoded in `main.rs`)
-- **Scaling**: Parses O(N) processes; 1000 processes = ~50ms collection time on modern hardware
+# macOS and Windows
+./memz
+```
 
-## Limitations
+---
 
-- Linux-only (requires procfs)
-- Cannot track memory outside procfs (kernel internal structures, DMA buffers)
-- PSS calculation is a kernel estimation, not exact
-- Requires root (no workaround for security-restricted systems)
-- No historical data persistence (resets on restart)
+## What It Does
 
-## Use Cases
+- **Real PSS Accounting**: Reads `/proc/[pid]/smaps_rollup` to divide shared libraries equally among sharing processes, giving you realistic memory numbers that actually sum up to your total used RAM.
+- **Automated Leak Detection**: Fits an ordinary least squares regression line over a rolling window of recent samples. If a process shows persistent positive growth without garbage collection or release cycles, `memz` flags it with a red `[LEAK?]` label.
+- **Kernel PSI Pressure Tracking**: Reads `/proc/pressure/memory` to show whether the system is healthy, entering reclaim pressure, or actively swapping.
+- **Adaptive Polling Intervals**:
+  - `Eco (2.0s)`: Saves CPU cycles when memory is stable and pressure is low.
+  - `Normal (1.0s)`: Engaged when opening deep inspect modals.
+  - `Fast (0.5s)`: Triggered automatically when thrashing, high PSI stalls, or active leaks occur.
+  - Adjust manual speeds any time using `+` and `-`.
+- **Differential Snapshot Baselines**: Tap `b` at any point to save a baseline. Columns immediately switch to displaying relative growth ($\Delta$) since that snapshot, making it easy to benchmark a specific command or workload.
+- **Process Grouping**: Tap `g` to combine multi-process programs (such as Chrome, Firefox, or PostgreSQL workers) into a single row with unified totals.
+- **On-Demand Memory Inspector**: Press `Enter` on any process or group to inspect its breakdown across heap, stack, anonymous mappings, and shared libraries.
+- **Session Memory**: Remembers your preferred accent color, default view, sorting order, and grouping preferences between runs.
 
-### Development
-- Identify memory leaks during testing
-- Compare memory footprint of different implementations
-- Verify memory usage matches expectations
+---
 
-### System Administration
-- Diagnose out-of-memory conditions
-- Plan memory capacity for workloads
-- Monitor memory consumption trends
+## How the Math Works
 
-### Performance Analysis
-- Evaluate cache/buffer effectiveness
-- Analyze memory sharing in containerized environments
-- Debug swap usage patterns
+### PSS vs RSS
 
-## Advanced Tips
+Traditional tools sum Resident Set Size (RSS), where every process claims full ownership of shared code:
 
-### Comparing PSS vs RSS
+$$\text{RSS}_{\text{total}} = \sum_{i=1}^{M} \text{Pages}(P_i)$$
 
-Press `n` to cycle to RSS sort mode. Compare the "Process PSS" and "RSS" values in the top panel. The difference represents overcounted shared memory.
+PSS divides shared pages by the count of processes ($N$) sharing that physical frame:
 
-### Monitoring specific processes
+$$\text{PSS} = \text{Private Pages} + \sum_{j=1}^{S} \frac{\text{Shared Page}_j}{N_j}$$
 
-Start MEMZ, then note the PID of your target process. Press `n` until sorted by PID, then scroll to find it. The Delta column shows memory growth over time.
+When you sum PSS across every process on the machine, the result closely matches the physical RAM currently occupied by user processes:
 
-### NUMA awareness
+$$\sum_{i=1}^{M} \text{PSS}_i \approx \text{Physical RAM in Use}$$
 
-On multi-socket servers, the Memory Map view shows per-node statistics. Uneven distribution may indicate NUMA placement issues.
+### Statistical Leak Detection
+
+Instead of reacting to single allocation spikes, `memz` looks at rolling history buffers ($n \ge 8$) and computes an ordinary least squares regression slope:
+
+$$\bar{t} = \frac{1}{n}\sum_{i=1}^{n} t_i, \quad \bar{y} = \frac{1}{n}\sum_{i=1}^{n} \text{PSS}_i$$
+
+The sample slope $m$ and correlation quality $R^2$ are calculated as:
+
+$$m = \frac{\sum_{i=1}^{n} (t_i - \bar{t})(\text{PSS}_i - \bar{y})}{\sum_{i=1}^{n} (t_i - \bar{t})^2}$$
+
+$$R^2 = \frac{\left[\sum_{i=1}^{n} (t_i - \bar{t})(\text{PSS}_i - \bar{y})\right]^2}{\sum_{i=1}^{n} (t_i - \bar{t})^2 \cdot \sum_{i=1}^{n} (\text{PSS}_i - \bar{y})^2}$$
+
+Because sampling intervals can change, the growth rate is normalized by the real elapsed time ($\Delta t$):
+
+$$\text{Rate} = \frac{m}{\Delta t} \quad [\text{KB/s}]$$
+
+A process gets marked with `[LEAK?]` when:
+1. It has at least 8 consecutive samples.
+2. The normalized growth rate is at least $32\text{ KB/s}$.
+3. The fit linearity $R^2$ is $0.70$ or higher.
+4. Temporary drops do not exceed one third of total observed growth.
+
+---
+
+## Keyboard and Mouse Shortcuts
+
+### Main Controls
+
+| Key / Input | Context | What It Does |
+| :--- | :--- | :--- |
+| `Enter` | Processes | Open process breakdown inspector |
+| `/` | Processes | Filter rows by process name or PID |
+| `Shift + Tab` | Global | Cycle views (Processes $\to$ Memory Map $\to$ Shared Memory) |
+| `Ctrl + x` | Global | Open the scrollable command palette |
+| `Up` / `Down` | Tables / Menus | Move the active selection cursor |
+| `PgUp` / `PgDn` | Table | Jump by one visible page |
+| `Scroll Wheel` | Tables / Menus | Scroll content up or down |
+| `Left Click` | Table Header | Sort rows by clicked column |
+| `Left Click` | Row | Select process or open inspector |
+| `Right Click` | Modals / Row | Dismiss popup or inspect row under cursor |
+| `Esc` | Modals / Search | Exit prompt, clear filter, or close modal |
+
+### Quick Keys
+
+These single keys work directly in normal mode without opening `Ctrl + x`:
+
+| Key | What It Does |
+| :--- | :--- |
+| `g` | Toggle process grouping |
+| `b` | Save or clear relative baseline snapshot |
+| `n` | Cycle through sort columns (PSS, RSS, Shared, Private, Swap, Delta, PID, Name) |
+| `k` | Terminate selected process (SIGTERM) |
+| `c` | Open the 8-color theme picker |
+| `+` / `=` | Increase polling rate |
+| `-` / `_` | Decrease polling rate |
+| `q` | Exit memz |
+
+---
+
+## Saved Settings
+
+Settings are stored in a plain text configuration file on exit:
+
+- **Linux and macOS**: `$XDG_CONFIG_HOME/memz/state.conf` (defaults to `~/.config/memz/state.conf`)
+- **Windows**: `%APPDATA%\memz\state.conf`
+
+Sample configuration:
+```ini
+theme=ember_orange
+view_mode=processes
+sort_mode=pss
+tick_mode=auto
+grouped=false
+```
+
+---
 
 ## Technical Documentation
 
-For implementation details, architecture, and in-depth technical documentation, see [WIKI](README.wiki.md).
+If you want to read about the threading model, lockless communication channels, kernel procfs details, or benchmark numbers, check out the [Technical Wiki](README.wiki.md).
+
+## License
+
+Published under the MIT License. See [LICENSE](LICENSE) for details.
