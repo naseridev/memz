@@ -3,13 +3,18 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   build-release:
@@ -21,25 +26,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: false
-
+            use_cross: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            use_cross: false
-            install_musl: true
-
+            use_cross: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
-
           - target: x86_64-apple-darwin
             os: macos-13
             use_cross: false
-
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-14
             use_cross: false
-
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             use_cross: false
@@ -53,86 +52,56 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl tools (Linux musl only)
-        if: matrix.install_musl
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Install Cross (for ARM cross-compilation)
+      - name: Install cross-compilation tool
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross.git --rev 1b312cf
+        uses: taiki-e/install-action@cross
 
-      - name: Build binary (native)
-        if: "!matrix.use_cross"
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Build binary (cross)
-        if: matrix.use_cross
-        run: cross build --release --locked --target ${{ matrix.target }}
-
-      - name: Prepare package archive
+      - name: Build release binary
         shell: bash
         run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          ARCHIVE_NAME="memz-${VERSION}-${{ matrix.target }}"
-          DIST_DIR="dist/${ARCHIVE_NAME}"
-          mkdir -p "${DIST_DIR}"
-
-          BIN_NAME="memz"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            BIN_NAME="memz.exe"
-          fi
-
-          BIN_PATH="target/${{ matrix.target }}/release/${BIN_NAME}"
-          cp "${BIN_PATH}" "${DIST_DIR}/"
-
-          [ -f "README.md" ] && cp "README.md" "${DIST_DIR}/"
-          [ -f "LICENSE" ] && cp "LICENSE" "${DIST_DIR}/"
-
-          mkdir -p artifacts
-          cd dist
-
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "../artifacts/${ARCHIVE_NAME}.zip" "${ARCHIVE_NAME}"
-            cd ../artifacts
-            certutil -hashfile "${ARCHIVE_NAME}.zip" SHA256 | findstr -v ":" | tr -d " \r\n" > "${ARCHIVE_NAME}.zip.sha256"
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} --locked
           else
-            tar -czf "../artifacts/${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
-            cd ../artifacts
-            shasum -a 256 "${ARCHIVE_NAME}.tar.gz" | cut -d ' ' -f 1 > "${ARCHIVE_NAME}.tar.gz.sha256"
+            cargo build --release --target ${{ matrix.target }} --locked
           fi
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: artifacts-${{ matrix.target }}
-          path: artifacts/*
-          if-no-files-found: error
-
-  publish:
-    name: Publish GitHub Release
-    needs: build-release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets
-          merge-multiple: true
-
-      - name: Generate unified checksum manifest
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          cd release-assets
-          sha256sum memz-*.* > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          BIN_PATH="target/${{ matrix.target }}/release/memz"
+          PKG_NAME="memz-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$PKG_NAME"
+          cp "$BIN_PATH" "$PKG_NAME/"
+          [ -f README.md ] && cp README.md "$PKG_NAME/"
+          [ -f LICENSE ] && cp LICENSE "$PKG_NAME/"
+          tar -czvf "${PKG_NAME}.tar.gz" "$PKG_NAME"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+          else
+            shasum -a 256 "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+          fi
 
-      - name: Create GitHub Release
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          BIN_PATH="target/${{ matrix.target }}/release/memz.exe"
+          PKG_NAME="memz-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$PKG_NAME"
+          cp "$BIN_PATH" "$PKG_NAME/"
+          [ -f README.md ] && cp README.md "$PKG_NAME/"
+          [ -f LICENSE ] && cp LICENSE "$PKG_NAME/"
+          7z a "${PKG_NAME}.zip" "$PKG_NAME"
+          certutil -hashfile "${PKG_NAME}.zip" SHA256 | grep -E '^[0-9a-fA-F]{64}$' > "${PKG_NAME}.zip.sha256"
+
+      - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/*
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+            memz-*${{ matrix.target }}.tar.gz
+            memz-*${{ matrix.target }}.tar.gz.sha256
+            memz-*${{ matrix.target }}.zip
+            memz-*${{ matrix.target }}.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
