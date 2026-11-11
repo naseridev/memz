@@ -332,7 +332,13 @@ jobs:
             packaging/arch/PKGBUILD.in > "$work/PKGBUILD"
           chown -R builder:builder "$work"
           runuser -u builder -- bash -c "cd '${work}' && makepkg --force --noconfirm --cleanbuild"
-          cp "${work}/${APP_NAME}"-*.pkg.tar.zst "dist/${APP_NAME}-v${VERSION}-${TARGET}.pkg.tar.zst"
+          built="${work}/${APP_NAME}-${pkgver}-1-x86_64.pkg.tar.zst"
+          if [[ ! -f "$built" ]]; then
+            echo "::error::Expected ${built} but makepkg did not create it"
+            ls -l "$work"
+            exit 1
+          fi
+          cp "$built" "dist/${APP_NAME}-v${VERSION}-${TARGET}.pkg.tar.zst"
 
       - name: Verify package
         run: |
