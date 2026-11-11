@@ -2,8 +2,10 @@
 name = "memz"
 version = "2.0.0"
 edition = "2024"
-authors = ["Nima Naseri nerdnull@proton.me"]
+rust-version = "1.85"
+authors = ["Nima Naseri <nerdnull@proton.me>"]
 description = "Accurate terminal memory profiler"
+license = "GPL-3.0-only"
 repository = "https://github.com/naseridev/memz"
 keywords = ["memory", "monitoring", "system", "cross-platform"]
 categories = ["command-line-utilities"]

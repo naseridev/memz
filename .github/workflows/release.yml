@@ -256,6 +256,7 @@ jobs:
         run: |
           dotnet tool install --global wix --version 5.0.2
           $env:PATH = "$(Join-Path $env:USERPROFILE '.dotnet\tools');$env:PATH"
+          wix eula accept wix7
           $root = $PWD.Path
           $name = "$($env:APP_NAME)-v$($env:VERSION)-$($env:TARGET)"
           wix build -arch x64 `
@@ -271,7 +272,7 @@ jobs:
       - name: Verify packages
         run: |
           ls -l dist
-          count="$(find dist -type f | wc -l)"
+          count="$(find dist -type f | wc -l | tr -d ' ')"
           if (( count != EXPECTED_FILES )); then
             echo "::error::Expected ${EXPECTED_FILES} packages but found ${count}"
             exit 1
@@ -335,7 +336,7 @@ jobs:
 
       - name: Verify package
         run: |
-          count="$(find dist -maxdepth 1 -name '*.pkg.tar.zst' | wc -l)"
+          count="$(find dist -maxdepth 1 -name '*.pkg.tar.zst' | wc -l | tr -d ' ')"
           if (( count != 1 )); then
             echo "::error::Expected 1 Arch package but found ${count}"
             exit 1
