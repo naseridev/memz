@@ -124,6 +124,16 @@ impl Tui {
                 self.sync_inspector();
                 return false;
             }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let mode = self.app.faster_tick();
+                self.engine.set_tick_mode(mode);
+                return false;
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                let mode = self.app.slower_tick();
+                self.engine.set_tick_mode(mode);
+                return false;
+            }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 self.app.toggle_view();
                 self.sync_inspector();
@@ -197,6 +207,14 @@ impl Tui {
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.app.open_color_picker();
                 self.sync_inspector();
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let mode = self.app.faster_tick();
+                self.engine.set_tick_mode(mode);
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                let mode = self.app.slower_tick();
+                self.engine.set_tick_mode(mode);
             }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.engine.kill_pids(self.app.selected_pids());

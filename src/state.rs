@@ -1,7 +1,7 @@
 use crate::{
     analyzer::{AnalyzedState, ProcessStats, detect_leak, signed_diff},
     collector::MemoryBreakdown,
-    config::{THEME_PRESETS, ThemePreset, UserConfig},
+    config::{THEME_PRESETS, ThemePreset, TickMode, UserConfig},
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -232,6 +232,7 @@ pub struct App {
     pub baseline_system_pss_kb: Option<u64>,
     pub sort_mode: SortMode,
     pub view_mode: ViewMode,
+    pub tick_mode: TickMode,
     pub theme: ThemePreset,
     pub theme_index: usize,
     pub choosing_color: bool,
@@ -252,6 +253,7 @@ impl App {
         Self {
             sort_mode: cfg.sort_mode,
             view_mode: cfg.view_mode,
+            tick_mode: cfg.tick_mode,
             theme: cfg.theme,
             theme_index: cfg.theme.index(),
             grouped: cfg.grouped,
@@ -269,9 +271,22 @@ impl App {
             theme: self.theme,
             view_mode: self.view_mode,
             sort_mode: self.sort_mode,
+            tick_mode: self.tick_mode,
             grouped: self.grouped,
         };
         cfg.save();
+    }
+
+    pub fn faster_tick(&mut self) -> TickMode {
+        self.tick_mode = self.tick_mode.step_faster();
+        self.save_config();
+        self.tick_mode
+    }
+
+    pub fn slower_tick(&mut self) -> TickMode {
+        self.tick_mode = self.tick_mode.step_slower();
+        self.save_config();
+        self.tick_mode
     }
 
     pub fn open_color_picker(&mut self) {
@@ -556,6 +571,7 @@ impl App {
 
     fn build_grouped_rows(&self, processes: &[&ProcessStats]) -> Vec<DisplayRow> {
         let has_baseline = self.baseline_system_pss_kb.is_some();
+        let dt_secs = (self.state.system.tick_ms.max(100) as f64) / 1000.0;
         let mut groups: HashMap<Arc<str>, DisplayRow> = HashMap::new();
 
         for proc_stat in processes {
@@ -573,8 +589,7 @@ impl App {
 
             if !group.is_leaking {
                 let history_queue: VecDeque<u64> = group.pss_history.iter().copied().collect();
-                let (is_leaking, leak_rate_kb) = detect_leak(&history_queue);
-
+                let (is_leaking, leak_rate_kb) = detect_leak(&history_queue, dt_secs);
                 group.is_leaking = is_leaking;
                 group.leak_rate_kb = leak_rate_kb;
             }

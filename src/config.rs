@@ -17,6 +17,61 @@ pub enum ThemePreset {
     RosePink,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TickMode {
+    #[default]
+    Auto,
+    Fast,
+    Normal,
+    Eco,
+}
+
+impl TickMode {
+    pub fn step_faster(self) -> Self {
+        match self {
+            Self::Auto | Self::Normal => Self::Fast,
+            Self::Eco => Self::Normal,
+            Self::Fast => Self::Auto,
+        }
+    }
+
+    pub fn step_slower(self) -> Self {
+        match self {
+            Self::Auto | Self::Fast => Self::Normal,
+            Self::Normal => Self::Eco,
+            Self::Eco => Self::Auto,
+        }
+    }
+
+    pub fn label(self, active_ms: u64) -> String {
+        let ms = if active_ms > 0 { active_ms } else { 1000 };
+        match self {
+            Self::Auto => format!("Auto ({:.1}s)", ms as f64 / 1000.0),
+            Self::Fast => String::from("Fast (0.5s)"),
+            Self::Normal => String::from("Normal (1.0s)"),
+            Self::Eco => String::from("Eco (2.0s)"),
+        }
+    }
+
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fast => "fast",
+            Self::Normal => "normal",
+            Self::Eco => "eco",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "fast" => Self::Fast,
+            "normal" => Self::Normal,
+            "eco" => Self::Eco,
+            _ => Self::Auto,
+        }
+    }
+}
+
 pub const THEME_PRESETS: [ThemePreset; 8] = [
     ThemePreset::EmberOrange,
     ThemePreset::CyberCyan,
@@ -94,6 +149,7 @@ pub struct UserConfig {
     pub theme: ThemePreset,
     pub view_mode: ViewMode,
     pub sort_mode: SortMode,
+    pub tick_mode: TickMode,
     pub grouped: bool,
 }
 
@@ -121,6 +177,7 @@ impl UserConfig {
                 "theme" => cfg.theme = ThemePreset::from_key(val),
                 "view_mode" => cfg.view_mode = ViewMode::from_key(val),
                 "sort_mode" => cfg.sort_mode = SortMode::from_key(val),
+                "tick_mode" => cfg.tick_mode = TickMode::from_key(val),
                 "grouped" => cfg.grouped = val == "true",
                 _ => {}
             }
@@ -138,10 +195,11 @@ impl UserConfig {
         }
 
         let body = format!(
-            "theme={}\nview_mode={}\nsort_mode={}\ngrouped={}\n",
+            "theme={}\nview_mode={}\nsort_mode={}\ntick_mode={}\ngrouped={}\n",
             self.theme.as_key(),
             self.view_mode.as_key(),
             self.sort_mode.as_key(),
+            self.tick_mode.as_key(),
             self.grouped
         );
 

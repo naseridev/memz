@@ -54,6 +54,7 @@ pub struct SystemStats {
     pub psi_some_avg10: f64,
     pub psi_full_avg10: f64,
     pub pressure_level: PressureLevel,
+    pub tick_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -107,7 +108,9 @@ pub fn build_state(
     numa_nodes: Vec<NumaNode>,
     system_history: &mut VecDeque<u64>,
     last_swap_used_kb: &mut Option<u64>,
+    dt_secs: f64,
 ) -> AnalyzedState {
+    let dt = dt_secs.max(0.1);
     let used_kb = sys.total_kb.saturating_sub(sys.available_kb);
 
     if system_history.len() == MAX_HISTORY_SAMPLES {
@@ -118,7 +121,8 @@ pub fn build_state(
 
     let swap_used = sys.swap_total_kb.saturating_sub(sys.swap_free_kb);
     let prev_swap = last_swap_used_kb.replace(swap_used).unwrap_or(swap_used);
-    let swap_rate_kb = signed_diff(swap_used, prev_swap);
+    let raw_swap_diff = signed_diff(swap_used, prev_swap);
+    let swap_rate_kb = (raw_swap_diff as f64 / dt).round() as i64;
 
     let avail_pct = if sys.total_kb > 0 {
         (sys.available_kb as f64 / sys.total_kb as f64) * 100.0
@@ -177,6 +181,7 @@ pub fn build_state(
             psi_some_avg10: sys.psi_some_avg10,
             psi_full_avg10: sys.psi_full_avg10,
             pressure_level,
+            tick_ms: (dt * 1000.0).round() as u64,
         },
         shared_memory: SharedMemoryStats {
             total_shared_kb,
@@ -206,7 +211,7 @@ pub fn signed_diff(curr: u64, base: u64) -> i64 {
     }
 }
 
-pub fn detect_leak(history: &VecDeque<u64>) -> (bool, u64) {
+pub fn detect_leak(history: &VecDeque<u64>, dt_secs: f64) -> (bool, u64) {
     let (Some(&first), Some(&last)) = (history.front(), history.back()) else {
         return (false, 0);
     };
@@ -250,10 +255,12 @@ pub fn detect_leak(history: &VecDeque<u64>) -> (bool, u64) {
         return (false, 0);
     }
 
-    let (slope, r2) = (num / den_x, (num * num) / (den_x * den_y));
+    let slope_per_sample = num / den_x;
+    let slope_per_sec = slope_per_sample / dt_secs.max(0.1);
+    let r2 = (num * num) / (den_x * den_y);
 
-    if slope >= 32.0 && r2 >= 0.70 {
-        (true, slope.round() as u64)
+    if slope_per_sec >= 32.0 && r2 >= 0.70 {
+        (true, slope_per_sec.round() as u64)
     } else {
         (false, 0)
     }

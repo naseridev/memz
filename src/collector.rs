@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 use sysinfo::{
     MemoryRefreshKind, Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
 };
@@ -57,6 +58,7 @@ pub struct Collector {
     tracks: HashMap<u32, ProcTrack>,
     system_history: VecDeque<u64>,
     last_swap_used_kb: Option<u64>,
+    last_collect: Option<Instant>,
 }
 
 impl Collector {
@@ -66,6 +68,7 @@ impl Collector {
             tracks: HashMap::new(),
             system_history: VecDeque::with_capacity(MAX_HISTORY_SAMPLES),
             last_swap_used_kb: None,
+            last_collect: None,
         })
     }
 
@@ -103,6 +106,14 @@ impl Collector {
     }
 
     pub fn collect(&mut self) -> Result<AnalyzedState> {
+        let now = Instant::now();
+        let dt_secs = self
+            .last_collect
+            .map(|prev| now.saturating_duration_since(prev).as_secs_f64())
+            .unwrap_or(1.0)
+            .clamp(0.1, 10.0);
+        self.last_collect = Some(now);
+
         self.sys
             .refresh_memory_specifics(MemoryRefreshKind::everything());
 
@@ -114,7 +125,7 @@ impl Collector {
             .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
 
         let system_memory = self.collect_system_memory();
-        let (processes, totals) = self.collect_and_analyze_processes();
+        let (processes, totals) = self.collect_and_analyze_processes(dt_secs);
         let numa_nodes = Self::collect_numa_info();
 
         Ok(build_state(
@@ -124,6 +135,7 @@ impl Collector {
             numa_nodes,
             &mut self.system_history,
             &mut self.last_swap_used_kb,
+            dt_secs,
         ))
     }
 
@@ -148,6 +160,7 @@ impl Collector {
                 };
 
                 let value = val_str.parse::<u64>().unwrap_or(0);
+
                 match key {
                     "Buffers:" => memory.buffers_kb = value,
                     "Cached:" => memory.cached_kb = value,
@@ -196,7 +209,7 @@ impl Collector {
         }
     }
 
-    fn collect_and_analyze_processes(&mut self) -> (Vec<ProcessStats>, ProcTotals) {
+    fn collect_and_analyze_processes(&mut self, dt_secs: f64) -> (Vec<ProcessStats>, ProcTotals) {
         let process_map = self.sys.processes();
         let mut next_tracks = HashMap::with_capacity(process_map.len());
         let mut totals = ProcTotals::default();
@@ -223,7 +236,7 @@ impl Collector {
             }
             track.history.push_back(metrics.pss_kb);
 
-            let (is_leaking, leak_rate_kb) = detect_leak(&track.history);
+            let (is_leaking, leak_rate_kb) = detect_leak(&track.history, dt_secs);
             let pss_history = track.history.iter().copied().collect();
 
             let shared_kb = metrics

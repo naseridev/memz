@@ -159,6 +159,9 @@ fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("Pressure: ", label_style),
             Span::styled(pressure_text, pressure_style),
             Span::raw(psi_suffix),
+            Span::raw(" | "),
+            Span::styled("Tick: ", label_style),
+            Span::raw(app.tick_mode.label(sys.tick_ms)),
         ]),
     ];
 
@@ -179,7 +182,7 @@ fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
 
     let trend_block = Block::default()
         .borders(Borders::ALL)
-        .title("Memory Trend (60s)");
+        .title("Memory Trend (60 Samples)");
 
     let sparkline = Sparkline::default()
         .block(trend_block)
@@ -588,18 +591,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         )])
     } else if app.inspecting {
         Line::from(vec![Span::raw(
-            "Esc/Enter: close | Up/Down: prev/next | k: kill | b: base~ | c: color | q: quit",
+            "Esc/Enter: close | Up/Down: nav | k: kill | b: base~ | +/-: speed | c: color | q: quit",
         )])
     } else if app.is_process_view() {
         Line::from(vec![
             Span::raw(
-                "q: quit | Enter: inspect | /: search | g: group | n: sort | k: kill | b: base~ | c: color | v: ",
+                "q: quit | Enter: inspect | /: search | g: group | n: sort | k: kill | b: base~ | +/-: speed | c: color | v: ",
             ),
             Span::styled(next_view, secondary),
         ])
     } else {
         Line::from(vec![
-            Span::raw("q: quit | b/Space: base~ | c: color | v: "),
+            Span::raw("q: quit | b/Space: base~ | +/-: speed | c: color | v: "),
             Span::styled(next_view, secondary),
             Span::raw(" view"),
         ])
