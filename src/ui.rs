@@ -2,7 +2,7 @@ use crate::{
     analyzer::{PressureLevel, signed_diff},
     collector::MemoryBreakdown,
     config::THEME_PRESETS,
-    state::{App, DisplayRow, TABLE_CONSTRAINTS, ViewMode},
+    state::{App, DisplayRow, SHORTCUT_ITEMS, TABLE_CONSTRAINTS, ViewMode},
 };
 use ratatui::{
     Frame,
@@ -63,7 +63,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_footer(frame, layout[2], app);
 
-    if app.choosing_color {
+    if app.showing_shortcuts {
+        app.modal_area = centered_rect(48, 48, frame.area());
+        draw_shortcuts_modal(frame, app.modal_area, app);
+    } else if app.choosing_color {
         app.modal_area = centered_rect(36, 44, frame.area());
         draw_color_modal(frame, app.modal_area, app);
     } else if app.inspecting && app.is_process_view() {
@@ -168,7 +171,6 @@ fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
     let summary_block = Block::default()
         .borders(Borders::ALL)
         .title("System Memory");
-
     frame.render_widget(
         Paragraph::new(summary_lines).block(summary_block),
         columns[0],
@@ -179,17 +181,14 @@ fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         accent
     };
-
     let trend_block = Block::default()
         .borders(Borders::ALL)
         .title("Memory Trend (60 Samples)");
-
     let sparkline = Sparkline::default()
         .block(trend_block)
         .data(&sys.history_used_kb)
         .max(sys.total_kb.max(1))
         .style(Style::default().fg(spark_color));
-
     frame.render_widget(sparkline, columns[1]);
 }
 
@@ -214,11 +213,9 @@ fn draw_process_list(frame: &mut Frame, area: Rect, app: &mut App) {
         "Swap",
         delta_header,
     ];
-
     let header_cells = column_titles
         .into_iter()
         .map(|title| Text::from(title).style(header_style));
-
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let mut leaking_count = 0usize;
@@ -294,7 +291,6 @@ fn format_process_table_title(app: &App, leaking_count: usize) -> String {
     } else {
         app.selected_index + 1
     };
-
     let total = app.display_rows.len();
     let sort_label = app.sort_mode.label(app.grouped);
 
@@ -303,20 +299,68 @@ fn format_process_table_title(app: &App, leaking_count: usize) -> String {
     if app.grouped {
         title.push_str(" [Grouped]");
     }
-
     if app.baseline_system_pss_kb.is_some() {
         title.push_str(" [Base~]");
     }
-
     if !app.search_query.is_empty() {
         title.push_str(&format!(" [Filter: {}]", app.search_query));
     }
-
     if leaking_count > 0 {
         title.push_str(&format!(" [Leaks: {leaking_count}]"));
     }
 
     title
+}
+
+fn draw_shortcuts_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let accent = app.accent_color();
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .title(" Shortcuts ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = Vec::with_capacity(SHORTCUT_ITEMS.len() + 3);
+    lines.push(Line::from(""));
+
+    for (idx, (key, desc)) in SHORTCUT_ITEMS.iter().enumerate() {
+        let is_selected = idx == app.shortcuts_index;
+        let marker = if is_selected { " > " } else { "   " };
+        let (key_style, desc_style) = if is_selected {
+            (
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                Style::default().fg(accent),
+                Style::default().fg(COLOR_PRIMARY),
+            )
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{key:<7}"), key_style),
+            Span::raw(" "),
+            Span::styled(*desc, desc_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Up/Down: select | Enter: run | Esc: close",
+        Style::default().fg(accent),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
@@ -338,7 +382,6 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(accent))
         .title(title);
     let inner_area = outer_block.inner(area);
-
     frame.render_widget(outer_block, area);
 
     let modal_chunks = Layout::default()
@@ -425,7 +468,6 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         accent
     };
-
     let sparkline = Sparkline::default()
         .block(
             Block::default()
@@ -505,7 +547,6 @@ fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
     for (label, kb, color) in categories {
         let pct = percentage(kb, total_kb);
         let bar = ascii_bar(pct, 45);
-
         lines.push(Line::from(vec![
             Span::styled(format!("{label:16} "), Style::default().fg(color)),
             Span::raw(format!("{:7.1} GiB ({:5.1}%) ", to_gib(kb), pct)),
@@ -516,7 +557,6 @@ fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
     if !app.state.numa_nodes.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("NUMA Nodes:", header_style)));
-
         for node in &app.state.numa_nodes {
             let used_pct = percentage(node.mem_used_kb, node.mem_total_kb);
             lines.push(Line::from(format!(
@@ -532,7 +572,6 @@ fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Physical Memory Map");
-
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -567,49 +606,83 @@ fn draw_shared_view(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let secondary = Style::default().fg(app.accent_color());
+    let accent = app.accent_color();
 
     if app.searching {
         let search_line = Line::from(vec![
-            Span::styled("Search: ", secondary.add_modifier(Modifier::BOLD)),
-            Span::raw(&app.search_query),
-            Span::styled("_", secondary),
-            Span::raw("  (Enter: lock | Esc: clear)"),
+            Span::styled(
+                "Search",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":", Style::default().fg(COLOR_PRIMARY)),
+            Span::styled(&app.search_query, Style::default().fg(COLOR_PRIMARY)),
+            Span::styled("_", Style::default().fg(accent)),
+            Span::styled("  |  ", Style::default().fg(COLOR_PRIMARY)),
+            Span::styled(
+                "Enter",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":lock", Style::default().fg(COLOR_PRIMARY)),
+            Span::styled("  |  ", Style::default().fg(COLOR_PRIMARY)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":clear", Style::default().fg(COLOR_PRIMARY)),
         ]);
-
-        let block = Block::default().borders(Borders::ALL).title("Filter");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(COLOR_PRIMARY))
+            .title("Filter");
         frame.render_widget(Paragraph::new(vec![search_line]).block(block), area);
-
         return;
     }
 
-    let next_view = app.view_mode.next_label();
+    let key_style = Style::default()
+        .fg(COLOR_PRIMARY)
+        .add_modifier(Modifier::BOLD);
+    let colon_style = Style::default().fg(COLOR_PRIMARY);
+    let desc_style = Style::default().fg(COLOR_PRIMARY);
+    let sep_style = Style::default().fg(COLOR_PRIMARY);
 
-    let controls_line = if app.choosing_color {
-        Line::from(vec![Span::raw(
-            "Up/Down: select color | Enter/Esc/c: close | q: quit",
-        )])
+    let mut spans = Vec::new();
+
+    if app.is_process_view() && !app.inspecting {
+        spans.push(Span::styled("Enter", key_style));
+        spans.push(Span::styled(":", colon_style));
+        spans.push(Span::styled("inspect", desc_style));
+        spans.push(Span::styled("  |  ", sep_style));
+
+        spans.push(Span::styled("/", key_style));
+        spans.push(Span::styled(":", colon_style));
+        spans.push(Span::styled("search", desc_style));
+        spans.push(Span::styled("  |  ", sep_style));
     } else if app.inspecting {
-        Line::from(vec![Span::raw(
-            "Esc/Enter: close | Up/Down: nav | k: kill | b: base~ | +/-: speed | c: color | q: quit",
-        )])
-    } else if app.is_process_view() {
-        Line::from(vec![
-            Span::raw(
-                "q: quit | Enter: inspect | /: search | g: group | n: sort | k: kill | b: base~ | +/-: speed | c: color | v: ",
-            ),
-            Span::styled(next_view, secondary),
-        ])
-    } else {
-        Line::from(vec![
-            Span::raw("q: quit | b/Space: base~ | +/-: speed | c: color | v: "),
-            Span::styled(next_view, secondary),
-            Span::raw(" view"),
-        ])
-    };
+        spans.push(Span::styled("Esc", key_style));
+        spans.push(Span::styled(":", colon_style));
+        spans.push(Span::styled("close", desc_style));
+        spans.push(Span::styled("  |  ", sep_style));
 
-    let block = Block::default().borders(Borders::ALL).title("Controls");
-    frame.render_widget(Paragraph::new(vec![controls_line]).block(block), area);
+        spans.push(Span::styled("Up/Down", key_style));
+        spans.push(Span::styled(":", colon_style));
+        spans.push(Span::styled("navigate", desc_style));
+        spans.push(Span::styled("  |  ", sep_style));
+    }
+
+    spans.push(Span::styled("Shift+Tab", key_style));
+    spans.push(Span::styled(":", colon_style));
+    spans.push(Span::styled("mode", desc_style));
+    spans.push(Span::styled("  |  ", sep_style));
+
+    spans.push(Span::styled("Ctrl+x", key_style));
+    spans.push(Span::styled(":", colon_style));
+    spans.push(Span::styled("shortcuts", desc_style));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_PRIMARY))
+        .title("Controls");
+    frame.render_widget(Paragraph::new(vec![Line::from(spans)]).block(block), area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

@@ -34,6 +34,17 @@ const SORT_COLUMNS: [SortMode; 8] = [
     SortMode::Delta,
 ];
 
+pub const SHORTCUT_ITEMS: [(&str, &str); 8] = [
+    ("g", "Group / Ungroup processes"),
+    ("b", "Toggle snapshot baseline"),
+    ("n", "Cycle sort column"),
+    ("k", "Kill selected process"),
+    ("c", "Theme color picker"),
+    ("+", "Increase polling speed"),
+    ("-", "Decrease polling speed"),
+    ("q", "Quit memz"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
     Pid,
@@ -236,6 +247,8 @@ pub struct App {
     pub theme: ThemePreset,
     pub theme_index: usize,
     pub choosing_color: bool,
+    pub showing_shortcuts: bool,
+    pub shortcuts_index: usize,
     pub grouped: bool,
     pub searching: bool,
     pub inspecting: bool,
@@ -289,8 +302,53 @@ impl App {
         self.tick_mode
     }
 
+    pub fn open_shortcuts(&mut self) {
+        self.close_inspector();
+        self.close_color_picker();
+        self.searching = false;
+        self.shortcuts_index = 0;
+        self.showing_shortcuts = true;
+    }
+
+    pub fn close_shortcuts(&mut self) {
+        self.showing_shortcuts = false;
+    }
+
+    pub fn move_shortcuts_selection(&mut self, delta: isize) {
+        let len = SHORTCUT_ITEMS.len() as isize;
+        let next = (self.shortcuts_index as isize + delta).rem_euclid(len) as usize;
+        self.shortcuts_index = next;
+    }
+
+    pub fn shortcut_index_at(&self, column: u16, row: u16) -> Option<usize> {
+        if !rect_contains(self.modal_area, column, row) {
+            return None;
+        }
+        let first_item_row = self.modal_area.y.saturating_add(2);
+        if row >= first_item_row {
+            let idx = (row - first_item_row) as usize;
+            if idx < SHORTCUT_ITEMS.len() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    pub fn is_inside_modal(&self, column: u16, row: u16) -> bool {
+        rect_contains(self.modal_area, column, row)
+    }
+
+    pub fn toggle_shortcuts(&mut self) {
+        if self.showing_shortcuts {
+            self.close_shortcuts();
+        } else {
+            self.open_shortcuts();
+        }
+    }
+
     pub fn open_color_picker(&mut self) {
         self.close_inspector();
+        self.close_shortcuts();
         self.searching = false;
         self.theme_index = self.theme.index();
         self.choosing_color = true;
@@ -304,7 +362,6 @@ impl App {
     pub fn move_color_selection(&mut self, delta: isize) {
         let len = THEME_PRESETS.len() as isize;
         let next = (self.theme_index as isize + delta).rem_euclid(len) as usize;
-
         self.theme_index = next;
         self.theme = THEME_PRESETS[next];
         self.save_config();
@@ -314,7 +371,6 @@ impl App {
         if !self.is_process_view() {
             return;
         }
-
         self.grouped = !self.grouped;
         self.selected_index = 0;
         self.rebuild_display_rows();
@@ -332,6 +388,8 @@ impl App {
 
     pub fn open_inspector(&mut self) {
         if self.is_process_view() && !self.display_rows.is_empty() {
+            self.close_shortcuts();
+            self.close_color_picker();
             self.inspecting = true;
             self.inspector_breakdown = None;
         }
@@ -383,7 +441,8 @@ impl App {
 
     pub fn toggle_view(&mut self) {
         self.close_inspector();
-        self.choosing_color = false;
+        self.close_color_picker();
+        self.close_shortcuts();
         self.searching = false;
         self.view_mode = self.view_mode.next();
         self.save_config();
@@ -407,22 +466,26 @@ impl App {
     }
 
     pub fn handle_left_click(&mut self, column: u16, row: u16) -> bool {
+        if self.showing_shortcuts {
+            if !rect_contains(self.modal_area, column, row) {
+                self.close_shortcuts();
+                return true;
+            }
+            return false;
+        }
+
         if self.choosing_color {
             if !rect_contains(self.modal_area, column, row) {
                 self.close_color_picker();
                 return true;
             }
-
             let first_item_row = self.modal_area.y.saturating_add(2);
-
             if row >= first_item_row {
                 let idx = (row - first_item_row) as usize;
-
                 if idx < THEME_PRESETS.len() {
                     self.theme_index = idx;
                     self.theme = THEME_PRESETS[idx];
                     self.close_color_picker();
-
                     return true;
                 }
             }
@@ -434,7 +497,6 @@ impl App {
                 self.close_inspector();
                 return true;
             }
-
             return false;
         }
 
@@ -462,6 +524,11 @@ impl App {
     }
 
     pub fn handle_right_click(&mut self, column: u16, row: u16) -> bool {
+        if self.showing_shortcuts {
+            self.close_shortcuts();
+            return true;
+        }
+
         if self.choosing_color {
             self.close_color_picker();
             return true;
@@ -483,7 +550,6 @@ impl App {
         self.selected_index = clicked_index;
         self.sync_table_state();
         self.open_inspector();
-
         true
     }
 
@@ -494,7 +560,6 @@ impl App {
             self.table_area.width.saturating_sub(2),
             1,
         );
-
         let column_rects = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(TABLE_CONSTRAINTS)
@@ -510,7 +575,6 @@ impl App {
                 return true;
             }
         }
-
         false
     }
 
@@ -524,7 +588,6 @@ impl App {
 
         let relative_row = (row - first_data_row) as usize;
         let index = self.table_state.offset().saturating_add(relative_row);
-
         (index < self.display_rows.len()).then_some(index)
     }
 
@@ -545,7 +608,6 @@ impl App {
 
         let sort_mode = self.sort_mode;
         let grouped = self.grouped;
-
         rows.sort_unstable_by(|left, right| compare_rows(left, right, sort_mode, grouped));
 
         self.display_rows = rows;
@@ -586,7 +648,6 @@ impl App {
                 let base = self.baseline_groups.get(&group.name).copied().unwrap_or(0);
                 group.pss_delta_kb = signed_diff(group.pss_kb, base);
             }
-
             if !group.is_leaking {
                 let history_queue: VecDeque<u64> = group.pss_history.iter().copied().collect();
                 let (is_leaking, leak_rate_kb) = detect_leak(&history_queue, dt_secs);
@@ -614,7 +675,6 @@ fn matches_query(proc_stat: &ProcessStats, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-
     proc_stat.name.to_lowercase().contains(query) || proc_stat.pid.to_string().contains(query)
 }
 
@@ -675,15 +735,12 @@ fn merge_history(target: &mut Vec<u64>, source: &[u64]) {
     if source.is_empty() {
         return;
     }
-
     if target.len() < source.len() {
         let mut padded = vec![0u64; source.len() - target.len()];
         padded.append(target);
         *target = padded;
     }
-
     let offset = target.len() - source.len();
-
     for (target_val, &source_val) in target.iter_mut().skip(offset).zip(source) {
         *target_val = target_val.saturating_add(source_val);
     }

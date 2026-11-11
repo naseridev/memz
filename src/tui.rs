@@ -22,14 +22,11 @@ pub struct Tui {
 impl Tui {
     pub fn new(engine: Engine) -> Result<Self> {
         let mut app = App::new();
-
         if let Some(initial) = engine.try_recv() {
             app.update_data(initial);
         }
-
         let terminal = ratatui::init();
         let _ = execute!(io::stdout(), EnableMouseCapture);
-
         Ok(Self {
             terminal,
             engine,
@@ -83,11 +80,9 @@ impl Tui {
 
         if let Some(state) = self.engine.try_recv() {
             self.app.update_data(state);
-
             if self.app.inspecting {
                 self.engine.inspect_pids(self.app.selected_pids());
             }
-
             updated = true;
         }
 
@@ -104,6 +99,27 @@ impl Tui {
             return true;
         }
 
+        let is_shift_tab = key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT));
+
+        if is_shift_tab {
+            self.app.toggle_view();
+            self.sync_inspector();
+            return false;
+        }
+
+        let is_ctrl_x = (key.code == KeyCode::Char('x') || key.code == KeyCode::Char('X'))
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+
+        if is_ctrl_x {
+            self.app.toggle_shortcuts();
+            return false;
+        }
+
+        if self.app.showing_shortcuts {
+            return self.handle_shortcuts_key(key);
+        }
+
         if self.app.choosing_color {
             return self.handle_color_picker_key(key);
         }
@@ -117,11 +133,17 @@ impl Tui {
             return self.handle_inspector_key(key);
         }
 
+        if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
+            return true;
+        }
+
         match key.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+            KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Char(' ') => {
+                self.app.toggle_baseline();
+                return false;
+            }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 self.app.open_color_picker();
-                self.sync_inspector();
                 return false;
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -134,15 +156,6 @@ impl Tui {
                 self.engine.set_tick_mode(mode);
                 return false;
             }
-            KeyCode::Char('v') | KeyCode::Char('V') => {
-                self.app.toggle_view();
-                self.sync_inspector();
-                return false;
-            }
-            KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Char(' ') => {
-                self.app.toggle_baseline();
-                return false;
-            }
             _ => {}
         }
 
@@ -150,6 +163,90 @@ impl Tui {
             self.handle_process_view_key(key);
         }
 
+        false
+    }
+
+    fn handle_shortcuts_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+            KeyCode::Esc => {
+                self.app.close_shortcuts();
+            }
+            KeyCode::Up => {
+                self.app.move_shortcuts_selection(-1);
+            }
+            KeyCode::Down => {
+                self.app.move_shortcuts_selection(1);
+            }
+            KeyCode::Enter => {
+                return self.execute_active_shortcut();
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                self.app.toggle_group();
+                self.app.close_shortcuts();
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Char(' ') => {
+                self.app.toggle_baseline();
+                self.app.close_shortcuts();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.app.next_sort();
+                self.app.close_shortcuts();
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.engine.kill_pids(self.app.selected_pids());
+                self.app.close_shortcuts();
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.app.close_shortcuts();
+                self.app.open_color_picker();
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let mode = self.app.faster_tick();
+                self.engine.set_tick_mode(mode);
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                let mode = self.app.slower_tick();
+                self.engine.set_tick_mode(mode);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn execute_active_shortcut(&mut self) -> bool {
+        match self.app.shortcuts_index {
+            0 => {
+                self.app.toggle_group();
+                self.app.close_shortcuts();
+            }
+            1 => {
+                self.app.toggle_baseline();
+                self.app.close_shortcuts();
+            }
+            2 => {
+                self.app.next_sort();
+                self.app.close_shortcuts();
+            }
+            3 => {
+                self.engine.kill_pids(self.app.selected_pids());
+                self.app.close_shortcuts();
+            }
+            4 => {
+                self.app.close_shortcuts();
+                self.app.open_color_picker();
+            }
+            5 => {
+                let mode = self.app.faster_tick();
+                self.engine.set_tick_mode(mode);
+            }
+            6 => {
+                let mode = self.app.slower_tick();
+                self.engine.set_tick_mode(mode);
+            }
+            7 => return true,
+            _ => {}
+        }
         false
     }
 
@@ -204,18 +301,6 @@ impl Tui {
                 self.app.close_inspector();
                 self.sync_inspector();
             }
-            KeyCode::Char('c') | KeyCode::Char('C') => {
-                self.app.open_color_picker();
-                self.sync_inspector();
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                let mode = self.app.faster_tick();
-                self.engine.set_tick_mode(mode);
-            }
-            KeyCode::Char('-') | KeyCode::Char('_') => {
-                let mode = self.app.slower_tick();
-                self.engine.set_tick_mode(mode);
-            }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.engine.kill_pids(self.app.selected_pids());
             }
@@ -246,7 +331,7 @@ impl Tui {
                     self.app.rebuild_display_rows();
                 }
             }
-            KeyCode::Enter | KeyCode::Char('i') | KeyCode::Char('I') => {
+            KeyCode::Enter => {
                 self.app.open_inspector();
                 self.sync_inspector();
             }
@@ -256,11 +341,11 @@ impl Tui {
             KeyCode::Char('g') | KeyCode::Char('G') => {
                 self.app.toggle_group();
             }
-            KeyCode::Char('k') | KeyCode::Char('K') => {
-                self.engine.kill_pids(self.app.selected_pids());
-            }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.app.next_sort();
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.engine.kill_pids(self.app.selected_pids());
             }
             KeyCode::Up => self.app.move_selection(-1),
             KeyCode::Down => self.app.move_selection(1),
@@ -271,6 +356,36 @@ impl Tui {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.app.showing_shortcuts {
+            return match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.app.move_shortcuts_selection(-1);
+                    true
+                }
+                MouseEventKind::ScrollDown => {
+                    self.app.move_shortcuts_selection(1);
+                    true
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(idx) = self.app.shortcut_index_at(mouse.column, mouse.row) {
+                        self.app.shortcuts_index = idx;
+                        self.execute_active_shortcut();
+                        true
+                    } else if !self.app.is_inside_modal(mouse.column, mouse.row) {
+                        self.app.close_shortcuts();
+                        true
+                    } else {
+                        false
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    self.app.close_shortcuts();
+                    true
+                }
+                _ => false,
+            };
+        }
+
         if self.app.choosing_color {
             return match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -328,7 +443,6 @@ impl Tui {
         } else {
             Vec::new()
         };
-
         self.engine.inspect_pids(pids);
     }
 }
@@ -336,7 +450,6 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         self.app.save_config();
-
         let _ = execute!(io::stdout(), DisableMouseCapture);
         ratatui::restore();
     }
