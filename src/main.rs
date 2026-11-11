@@ -3,6 +3,7 @@ use std::time::Duration;
 
 mod analyzer;
 mod collector;
+mod config;
 mod engine;
 mod state;
 mod tui;

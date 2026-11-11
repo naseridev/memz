@@ -1,9 +1,11 @@
 use crate::{
     analyzer::{AnalyzedState, ProcessStats, detect_leak, signed_diff},
     collector::MemoryBreakdown,
+    config::{THEME_PRESETS, ThemePreset, UserConfig},
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::Color,
     widgets::TableState,
 };
 use std::cmp::Ordering;
@@ -77,6 +79,32 @@ impl SortMode {
             Self::Name => Self::Pss,
         }
     }
+
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Pid => "pid",
+            Self::Name => "name",
+            Self::Pss => "pss",
+            Self::Rss => "rss",
+            Self::Shared => "shared",
+            Self::Private => "private",
+            Self::Swap => "swap",
+            Self::Delta => "delta",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "pid" => Self::Pid,
+            "name" => Self::Name,
+            "rss" => Self::Rss,
+            "shared" => Self::Shared,
+            "private" => Self::Private,
+            "swap" => Self::Swap,
+            "delta" => Self::Delta,
+            _ => Self::Pss,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,6 +129,22 @@ impl ViewMode {
             Self::Processes => "map",
             Self::MemoryMap => "shared",
             Self::SharedMemory => "process",
+        }
+    }
+
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Processes => "processes",
+            Self::MemoryMap => "memory_map",
+            Self::SharedMemory => "shared_memory",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "memory_map" => Self::MemoryMap,
+            "shared_memory" => Self::SharedMemory,
+            _ => Self::Processes,
         }
     }
 }
@@ -188,6 +232,9 @@ pub struct App {
     pub baseline_system_pss_kb: Option<u64>,
     pub sort_mode: SortMode,
     pub view_mode: ViewMode,
+    pub theme: ThemePreset,
+    pub theme_index: usize,
+    pub choosing_color: bool,
     pub grouped: bool,
     pub searching: bool,
     pub inspecting: bool,
@@ -201,10 +248,62 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
+        let cfg = UserConfig::load();
         Self {
+            sort_mode: cfg.sort_mode,
+            view_mode: cfg.view_mode,
+            theme: cfg.theme,
+            theme_index: cfg.theme.index(),
+            grouped: cfg.grouped,
             visible_rows: 20,
             ..Default::default()
         }
+    }
+
+    pub fn accent_color(&self) -> Color {
+        self.theme.color()
+    }
+
+    pub fn save_config(&self) {
+        let cfg = UserConfig {
+            theme: self.theme,
+            view_mode: self.view_mode,
+            sort_mode: self.sort_mode,
+            grouped: self.grouped,
+        };
+        cfg.save();
+    }
+
+    pub fn open_color_picker(&mut self) {
+        self.close_inspector();
+        self.searching = false;
+        self.theme_index = self.theme.index();
+        self.choosing_color = true;
+    }
+
+    pub fn close_color_picker(&mut self) {
+        self.choosing_color = false;
+        self.save_config();
+    }
+
+    pub fn move_color_selection(&mut self, delta: isize) {
+        let len = THEME_PRESETS.len() as isize;
+        let next = (self.theme_index as isize + delta).rem_euclid(len) as usize;
+
+        self.theme_index = next;
+        self.theme = THEME_PRESETS[next];
+        self.save_config();
+    }
+
+    pub fn toggle_group(&mut self) {
+        if !self.is_process_view() {
+            return;
+        }
+
+        self.grouped = !self.grouped;
+        self.selected_index = 0;
+        self.rebuild_display_rows();
+        self.save_config();
     }
 
     pub fn is_process_view(&self) -> bool {
@@ -264,12 +363,15 @@ impl App {
         self.sort_mode = self.sort_mode.next();
         self.selected_index = 0;
         self.rebuild_display_rows();
+        self.save_config();
     }
 
     pub fn toggle_view(&mut self) {
         self.close_inspector();
+        self.choosing_color = false;
         self.searching = false;
         self.view_mode = self.view_mode.next();
+        self.save_config();
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -290,11 +392,34 @@ impl App {
     }
 
     pub fn handle_left_click(&mut self, column: u16, row: u16) -> bool {
+        if self.choosing_color {
+            if !rect_contains(self.modal_area, column, row) {
+                self.close_color_picker();
+                return true;
+            }
+
+            let first_item_row = self.modal_area.y.saturating_add(2);
+
+            if row >= first_item_row {
+                let idx = (row - first_item_row) as usize;
+
+                if idx < THEME_PRESETS.len() {
+                    self.theme_index = idx;
+                    self.theme = THEME_PRESETS[idx];
+                    self.close_color_picker();
+
+                    return true;
+                }
+            }
+            return false;
+        }
+
         if self.inspecting {
             if !rect_contains(self.modal_area, column, row) {
                 self.close_inspector();
                 return true;
             }
+
             return false;
         }
 
@@ -322,6 +447,11 @@ impl App {
     }
 
     pub fn handle_right_click(&mut self, column: u16, row: u16) -> bool {
+        if self.choosing_color {
+            self.close_color_picker();
+            return true;
+        }
+
         if self.inspecting {
             self.close_inspector();
             return true;
@@ -338,6 +468,7 @@ impl App {
         self.selected_index = clicked_index;
         self.sync_table_state();
         self.open_inspector();
+
         true
     }
 
@@ -348,6 +479,7 @@ impl App {
             self.table_area.width.saturating_sub(2),
             1,
         );
+
         let column_rects = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(TABLE_CONSTRAINTS)
@@ -359,9 +491,11 @@ impl App {
                 self.sort_mode = mode;
                 self.selected_index = 0;
                 self.rebuild_display_rows();
+                self.save_config();
                 return true;
             }
         }
+
         false
     }
 
@@ -396,6 +530,7 @@ impl App {
 
         let sort_mode = self.sort_mode;
         let grouped = self.grouped;
+
         rows.sort_unstable_by(|left, right| compare_rows(left, right, sort_mode, grouped));
 
         self.display_rows = rows;
@@ -414,7 +549,6 @@ impl App {
                 } else {
                     proc_stat.pss_delta_kb
                 };
-
                 DisplayRow::from_process(proc_stat, delta_kb)
             })
             .collect()
@@ -436,6 +570,7 @@ impl App {
                 let base = self.baseline_groups.get(&group.name).copied().unwrap_or(0);
                 group.pss_delta_kb = signed_diff(group.pss_kb, base);
             }
+
             if !group.is_leaking {
                 let history_queue: VecDeque<u64> = group.pss_history.iter().copied().collect();
                 let (is_leaking, leak_rate_kb) = detect_leak(&history_queue);
@@ -464,6 +599,7 @@ fn matches_query(proc_stat: &ProcessStats, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
+
     proc_stat.name.to_lowercase().contains(query) || proc_stat.pid.to_string().contains(query)
 }
 
@@ -532,6 +668,7 @@ fn merge_history(target: &mut Vec<u64>, source: &[u64]) {
     }
 
     let offset = target.len() - source.len();
+
     for (target_val, &source_val) in target.iter_mut().skip(offset).zip(source) {
         *target_val = target_val.saturating_add(source_val);
     }

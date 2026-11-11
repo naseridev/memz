@@ -104,6 +104,10 @@ impl Tui {
             return true;
         }
 
+        if self.app.choosing_color {
+            return self.handle_color_picker_key(key);
+        }
+
         if self.app.searching {
             self.handle_search_key(key);
             return false;
@@ -115,6 +119,11 @@ impl Tui {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.app.open_color_picker();
+                self.sync_inspector();
+                return false;
+            }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 self.app.toggle_view();
                 self.sync_inspector();
@@ -131,6 +140,19 @@ impl Tui {
             self.handle_process_view_key(key);
         }
 
+        false
+    }
+
+    fn handle_color_picker_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.app.close_color_picker();
+            }
+            KeyCode::Up => self.app.move_color_selection(-1),
+            KeyCode::Down => self.app.move_color_selection(1),
+            _ => {}
+        }
         false
     }
 
@@ -172,6 +194,10 @@ impl Tui {
                 self.app.close_inspector();
                 self.sync_inspector();
             }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.app.open_color_picker();
+                self.sync_inspector();
+            }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.engine.kill_pids(self.app.selected_pids());
             }
@@ -210,9 +236,7 @@ impl Tui {
                 self.app.searching = true;
             }
             KeyCode::Char('g') | KeyCode::Char('G') => {
-                self.app.grouped = !self.app.grouped;
-                self.app.selected_index = 0;
-                self.app.rebuild_display_rows();
+                self.app.toggle_group();
             }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.engine.kill_pids(self.app.selected_pids());
@@ -229,6 +253,26 @@ impl Tui {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.app.choosing_color {
+            return match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.app.move_color_selection(-1);
+                    true
+                }
+                MouseEventKind::ScrollDown => {
+                    self.app.move_color_selection(1);
+                    true
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.app.handle_left_click(mouse.column, mouse.row)
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    self.app.handle_right_click(mouse.column, mouse.row)
+                }
+                _ => false,
+            };
+        }
+
         if !self.app.is_process_view() {
             return false;
         }
@@ -273,6 +317,8 @@ impl Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        self.app.save_config();
+
         let _ = execute!(io::stdout(), DisableMouseCapture);
         ratatui::restore();
     }

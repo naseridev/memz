@@ -1,6 +1,7 @@
 use crate::{
     analyzer::{PressureLevel, signed_diff},
     collector::MemoryBreakdown,
+    config::THEME_PRESETS,
     state::{App, DisplayRow, TABLE_CONSTRAINTS, ViewMode},
 };
 use ratatui::{
@@ -12,7 +13,6 @@ use ratatui::{
 };
 
 const COLOR_PRIMARY: Color = Color::White;
-const COLOR_SECONDARY: Color = Color::Rgb(255, 115, 40);
 const COLOR_ALERT: Color = Color::LightRed;
 const COLOR_HEALTHY: Color = Color::LightGreen;
 const SIGNIFICANT_DELTA_KB: i64 = 10_240;
@@ -63,7 +63,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_footer(frame, layout[2], app);
 
-    if app.inspecting && app.is_process_view() {
+    if app.choosing_color {
+        app.modal_area = centered_rect(36, 44, frame.area());
+        draw_color_modal(frame, app.modal_area, app);
+    } else if app.inspecting && app.is_process_view() {
         app.modal_area = centered_rect(58, 52, frame.area());
         draw_inspector_modal(frame, app.modal_area, app);
     }
@@ -71,7 +74,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
     let sys = &app.state.system;
-    let label_style = Style::default().fg(COLOR_SECONDARY);
+    let accent = app.accent_color();
+    let label_style = Style::default().fg(accent);
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -170,7 +174,7 @@ fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
     let spark_color = if sys.pressure_level == PressureLevel::Critical {
         COLOR_ALERT
     } else {
-        COLOR_SECONDARY
+        accent
     };
 
     let trend_block = Block::default()
@@ -187,9 +191,8 @@ fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_process_list(frame: &mut Frame, area: Rect, app: &mut App) {
-    let header_style = Style::default()
-        .fg(COLOR_SECONDARY)
-        .add_modifier(Modifier::BOLD);
+    let accent = app.accent_color();
+    let header_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
 
     let id_header = if app.grouped { "Count" } else { "PID" };
     let delta_header = if app.baseline_system_pss_kb.is_some() {
@@ -227,7 +230,7 @@ fn draw_process_list(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let title = format_process_table_title(app, leaking_count);
     let highlight_style = Style::default()
-        .bg(COLOR_SECONDARY)
+        .bg(accent)
         .fg(Color::Black)
         .add_modifier(Modifier::BOLD);
 
@@ -318,6 +321,7 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
+    let accent = app.accent_color();
     frame.render_widget(Clear, area);
 
     let title = if proc_row.count > 1 {
@@ -328,7 +332,7 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
 
     let outer_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLOR_SECONDARY))
+        .border_style(Style::default().fg(accent))
         .title(title);
     let inner_area = outer_block.inner(area);
 
@@ -339,9 +343,7 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(8), Constraint::Length(4)])
         .split(inner_area);
 
-    let label_style = Style::default()
-        .fg(COLOR_SECONDARY)
-        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
 
     let status_span = if proc_row.is_leaking {
         Span::styled(
@@ -389,10 +391,10 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
     ];
 
     let segments = [
-        ("Heap", breakdown.heap_kb, COLOR_SECONDARY),
+        ("Heap", breakdown.heap_kb, accent),
         ("Stack", breakdown.stack_kb, COLOR_PRIMARY),
         ("Anon", breakdown.anon_kb, COLOR_PRIMARY),
-        ("Libs", breakdown.libs_kb, COLOR_SECONDARY),
+        ("Libs", breakdown.libs_kb, accent),
     ];
 
     let pss_base = proc_row.pss_kb.max(1);
@@ -418,7 +420,7 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
     let spark_color = if proc_row.is_leaking {
         COLOR_ALERT
     } else {
-        COLOR_SECONDARY
+        accent
     };
 
     let sparkline = Sparkline::default()
@@ -434,12 +436,52 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(sparkline, modal_chunks[1]);
 }
 
+fn draw_color_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let accent = app.accent_color();
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .title(" Theme Color ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = Vec::with_capacity(THEME_PRESETS.len() + 3);
+    lines.push(Line::from(""));
+
+    for (idx, preset) in THEME_PRESETS.iter().enumerate() {
+        let is_selected = idx == app.theme_index;
+        let marker = if is_selected { " > " } else { "   " };
+        let row_style = if is_selected {
+            Style::default()
+                .fg(preset.color())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLOR_PRIMARY)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(marker, row_style),
+            Span::styled("### ", Style::default().fg(preset.color())),
+            Span::styled(preset.name(), row_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Up/Down: select | Enter/Esc: apply",
+        Style::default().fg(accent),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
     let map = &app.state.memory_map;
     let total_kb = app.state.system.total_kb;
-    let header_style = Style::default()
-        .fg(COLOR_SECONDARY)
-        .add_modifier(Modifier::BOLD);
+    let accent = app.accent_color();
+    let header_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
 
     let mut lines = vec![
         Line::from(Span::styled("Physical Memory Distribution:", header_style)),
@@ -447,14 +489,14 @@ fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
     ];
 
     let categories = [
-        ("Kernel", map.kernel_kb, COLOR_SECONDARY),
+        ("Kernel", map.kernel_kb, accent),
         ("Process Private", map.process_private_kb, COLOR_PRIMARY),
         ("Process Shared", map.process_shared_kb, COLOR_PRIMARY),
         ("Page Cache", map.cache_kb, COLOR_PRIMARY),
         ("Buffers", map.buffers_kb, COLOR_PRIMARY),
         ("Slab", map.slab_kb, COLOR_PRIMARY),
         ("Page Tables", map.page_tables_kb, COLOR_PRIMARY),
-        ("Free", map.free_kb, COLOR_SECONDARY),
+        ("Free", map.free_kb, accent),
     ];
 
     for (label, kb, color) in categories {
@@ -494,7 +536,7 @@ fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_shared_view(frame: &mut Frame, area: Rect, app: &App) {
     let shared = &app.state.shared_memory;
     let primary = Style::default().fg(COLOR_PRIMARY);
-    let secondary = Style::default().fg(COLOR_SECONDARY);
+    let secondary = Style::default().fg(app.accent_color());
 
     let lines = vec![
         Line::from(vec![
@@ -522,7 +564,7 @@ fn draw_shared_view(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let secondary = Style::default().fg(COLOR_SECONDARY);
+    let secondary = Style::default().fg(app.accent_color());
 
     if app.searching {
         let search_line = Line::from(vec![
@@ -540,20 +582,24 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     let next_view = app.view_mode.next_label();
 
-    let controls_line = if app.inspecting {
+    let controls_line = if app.choosing_color {
         Line::from(vec![Span::raw(
-            "Esc/Enter: close | Up/Down: prev/next | k: kill | b/Space: base~ | q: quit",
+            "Up/Down: select color | Enter/Esc/c: close | q: quit",
+        )])
+    } else if app.inspecting {
+        Line::from(vec![Span::raw(
+            "Esc/Enter: close | Up/Down: prev/next | k: kill | b: base~ | c: color | q: quit",
         )])
     } else if app.is_process_view() {
         Line::from(vec![
             Span::raw(
-                "q: quit | Enter: inspect | /: search | g: group | n: sort | k: kill | b: base~ | v: ",
+                "q: quit | Enter: inspect | /: search | g: group | n: sort | k: kill | b: base~ | c: color | v: ",
             ),
             Span::styled(next_view, secondary),
         ])
     } else {
         Line::from(vec![
-            Span::raw("q: quit | b/Space: base~ | v: "),
+            Span::raw("q: quit | b/Space: base~ | c: color | v: "),
             Span::styled(next_view, secondary),
             Span::raw(" view"),
         ])
