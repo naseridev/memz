@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
-use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, Default)]
 pub struct MemorySnapshot {
@@ -51,6 +51,20 @@ pub struct Collector {
 impl Collector {
     pub fn new() -> Result<Self> {
         Ok(Self { sys: System::new() })
+    }
+
+    pub fn kill_pids(&mut self, pids: &[u32]) {
+        for &pid in pids {
+            let sys_pid = Pid::from_u32(pid);
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[sys_pid]),
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            if let Some(proc_info) = self.sys.process(sys_pid) {
+                let _ = proc_info.kill();
+            }
+        }
     }
 
     pub fn collect(&mut self) -> Result<MemorySnapshot> {

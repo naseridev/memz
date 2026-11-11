@@ -1,11 +1,12 @@
-use crate::analyzer::AnalyzedState;
+use crate::analyzer::{AnalyzedState, ProcessStats};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Row, Table},
+    widgets::{Block, Borders, Paragraph, Row, Table, TableState},
 };
+use std::collections::HashMap;
 
 const COLOR_PRIMARY: Color = Color::White;
 const COLOR_SECONDARY: Color = Color::Rgb(255, 165, 0);
@@ -27,12 +28,31 @@ pub enum ViewMode {
     SharedMemory,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DisplayRow {
+    pid: u32,
+    count: usize,
+    name: String,
+    pss_kb: u64,
+    rss_kb: u64,
+    shared_kb: u64,
+    private_kb: u64,
+    swap_kb: u64,
+    pss_delta_kb: i64,
+    pids: Vec<u32>,
+}
+
 #[derive(Default)]
 pub struct App {
     state: AnalyzedState,
+    display_rows: Vec<DisplayRow>,
     sort_mode: SortMode,
     view_mode: ViewMode,
-    scroll_offset: usize,
+    grouped: bool,
+    searching: bool,
+    search_query: String,
+    selected_index: usize,
+    table_state: TableState,
     visible_rows: usize,
 }
 
@@ -46,8 +66,60 @@ impl App {
 
     pub fn update_data(&mut self, state: AnalyzedState) {
         self.state = state;
-        self.sort_processes();
-        self.clamp_scroll();
+        self.rebuild_display_rows();
+    }
+
+    pub fn is_searching(&self) -> bool {
+        self.searching
+    }
+
+    pub fn start_search(&mut self) {
+        self.view_mode = ViewMode::Processes;
+        self.searching = true;
+    }
+
+    pub fn finish_search(&mut self) {
+        self.searching = false;
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.searching = false;
+        self.search_query.clear();
+        self.selected_index = 0;
+        self.rebuild_display_rows();
+    }
+
+    pub fn clear_search(&mut self) {
+        if !self.search_query.is_empty() {
+            self.search_query.clear();
+            self.selected_index = 0;
+            self.rebuild_display_rows();
+        }
+    }
+
+    pub fn push_search_char(&mut self, c: char) {
+        self.search_query.push(c);
+        self.selected_index = 0;
+        self.rebuild_display_rows();
+    }
+
+    pub fn pop_search_char(&mut self) {
+        self.search_query.pop();
+        self.selected_index = 0;
+        self.rebuild_display_rows();
+    }
+
+    pub fn toggle_group(&mut self) {
+        self.grouped = !self.grouped;
+        self.selected_index = 0;
+        self.rebuild_display_rows();
+    }
+
+    pub fn selected_pids(&self) -> Vec<u32> {
+        self.display_rows
+            .get(self.selected_index)
+            .map(|r| r.pids.clone())
+            .unwrap_or_default()
     }
 
     pub fn next_sort(&mut self) {
@@ -57,8 +129,8 @@ impl App {
             SortMode::Shared => SortMode::Pid,
             SortMode::Pid => SortMode::Pss,
         };
-        self.sort_processes();
-        self.scroll_offset = 0;
+        self.selected_index = 0;
+        self.rebuild_display_rows();
     }
 
     pub fn toggle_view(&mut self) {
@@ -67,50 +139,117 @@ impl App {
             ViewMode::MemoryMap => ViewMode::SharedMemory,
             ViewMode::SharedMemory => ViewMode::Processes,
         };
-        self.scroll_offset = 0;
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        self.selected_index = self.selected_index.saturating_sub(1);
+        self.sync_table_state();
     }
 
     pub fn scroll_down(&mut self) {
-        if self.scroll_offset < self.max_scroll_offset() {
-            self.scroll_offset += 1;
+        if !self.display_rows.is_empty() && self.selected_index + 1 < self.display_rows.len() {
+            self.selected_index += 1;
+            self.sync_table_state();
         }
     }
 
     pub fn page_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(self.visible_rows);
+        self.selected_index = self.selected_index.saturating_sub(self.visible_rows.max(1));
+        self.sync_table_state();
     }
 
     pub fn page_down(&mut self) {
-        self.scroll_offset = self
-            .scroll_offset
-            .saturating_add(self.visible_rows)
-            .min(self.max_scroll_offset());
+        if !self.display_rows.is_empty() {
+            self.selected_index = self
+                .selected_index
+                .saturating_add(self.visible_rows.max(1))
+                .min(self.display_rows.len() - 1);
+            self.sync_table_state();
+        }
     }
 
-    fn sort_processes(&mut self) {
-        self.state
+    fn rebuild_display_rows(&mut self) {
+        let query = self.search_query.trim().to_lowercase();
+
+        let filtered: Vec<&ProcessStats> = self
+            .state
             .processes
-            .sort_unstable_by(|a, b| match self.sort_mode {
-                SortMode::Pss => b.pss_kb.cmp(&a.pss_kb).then_with(|| a.pid.cmp(&b.pid)),
-                SortMode::Rss => b.rss_kb.cmp(&a.rss_kb).then_with(|| a.pid.cmp(&b.pid)),
-                SortMode::Shared => b
-                    .shared_kb
-                    .cmp(&a.shared_kb)
-                    .then_with(|| a.pid.cmp(&b.pid)),
-                SortMode::Pid => a.pid.cmp(&b.pid),
-            });
+            .iter()
+            .filter(|p| {
+                query.is_empty()
+                    || p.name.to_lowercase().contains(&query)
+                    || p.pid.to_string().contains(&query)
+            })
+            .collect();
+
+        let mut rows: Vec<DisplayRow> = if self.grouped {
+            let mut groups: HashMap<String, DisplayRow> = HashMap::new();
+            for proc in filtered {
+                let entry = groups
+                    .entry(proc.name.clone())
+                    .or_insert_with(|| DisplayRow {
+                        pid: proc.pid,
+                        count: 0,
+                        name: proc.name.clone(),
+                        ..Default::default()
+                    });
+                entry.pid = entry.pid.min(proc.pid);
+                entry.count += 1;
+                entry.pss_kb = entry.pss_kb.saturating_add(proc.pss_kb);
+                entry.rss_kb = entry.rss_kb.saturating_add(proc.rss_kb);
+                entry.shared_kb = entry.shared_kb.saturating_add(proc.shared_kb);
+                entry.private_kb = entry.private_kb.saturating_add(proc.private_kb);
+                entry.swap_kb = entry.swap_kb.saturating_add(proc.swap_kb);
+                entry.pss_delta_kb = entry.pss_delta_kb.saturating_add(proc.pss_delta_kb);
+                entry.pids.push(proc.pid);
+            }
+            groups.into_values().collect()
+        } else {
+            filtered
+                .into_iter()
+                .map(|p| DisplayRow {
+                    pid: p.pid,
+                    count: 1,
+                    name: p.name.clone(),
+                    pss_kb: p.pss_kb,
+                    rss_kb: p.rss_kb,
+                    shared_kb: p.shared_kb,
+                    private_kb: p.private_kb,
+                    swap_kb: p.swap_kb,
+                    pss_delta_kb: p.pss_delta_kb,
+                    pids: vec![p.pid],
+                })
+                .collect()
+        };
+
+        rows.sort_unstable_by(|a, b| match self.sort_mode {
+            SortMode::Pss => b.pss_kb.cmp(&a.pss_kb).then_with(|| a.pid.cmp(&b.pid)),
+            SortMode::Rss => b.rss_kb.cmp(&a.rss_kb).then_with(|| a.pid.cmp(&b.pid)),
+            SortMode::Shared => b
+                .shared_kb
+                .cmp(&a.shared_kb)
+                .then_with(|| a.pid.cmp(&b.pid)),
+            SortMode::Pid => {
+                if self.grouped {
+                    b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name))
+                } else {
+                    a.pid.cmp(&b.pid)
+                }
+            }
+        });
+
+        self.display_rows = rows;
+        self.sync_table_state();
     }
 
-    fn max_scroll_offset(&self) -> usize {
-        self.state.processes.len().saturating_sub(self.visible_rows)
-    }
-
-    fn clamp_scroll(&mut self) {
-        self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
+    fn sync_table_state(&mut self) {
+        if self.display_rows.is_empty() {
+            self.selected_index = 0;
+            self.table_state.select(None);
+        } else {
+            self.selected_index = self.selected_index.min(self.display_rows.len() - 1);
+            self.table_state.select(Some(self.selected_index));
+        }
     }
 }
 
@@ -137,7 +276,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     app.visible_rows = chunks[1].height.saturating_sub(4) as usize;
-    app.clamp_scroll();
+    app.sync_table_state();
 
     draw_system_stats(f, chunks[0], app);
 
@@ -202,14 +341,16 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(para, area);
 }
 
-fn draw_process_list(f: &mut Frame, area: Rect, app: &App) {
+fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
     let header_style = Style::default()
         .fg(COLOR_SECONDARY)
         .add_modifier(Modifier::BOLD);
 
+    let first_col = if app.grouped { "Count" } else { "PID" };
+
     let header = Row::new(
         [
-            "PID", "Name", "PSS", "RSS", "Shared", "Private", "Swap", "Delta",
+            first_col, "Name", "PSS", "RSS", "Shared", "Private", "Swap", "Delta",
         ]
         .into_iter()
         .map(|h| Text::from(h).style(header_style)),
@@ -218,11 +359,8 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &App) {
     .bottom_margin(1);
 
     let rows: Vec<Row> = app
-        .state
-        .processes
+        .display_rows
         .iter()
-        .skip(app.scroll_offset)
-        .take(app.visible_rows)
         .map(|proc| {
             let delta_mb = proc.pss_delta_kb / 1024;
             let delta_str = if delta_mb != 0 {
@@ -237,8 +375,14 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
+            let id_col = if app.grouped {
+                format!("{}x", proc.count)
+            } else {
+                proc.pid.to_string()
+            };
+
             Row::new([
-                proc.pid.to_string(),
+                id_col,
                 proc.name.clone(),
                 format!("{} M", proc.pss_kb / 1024),
                 format!("{} M", proc.rss_kb / 1024),
@@ -255,15 +399,41 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &App) {
         SortMode::Pss => " [Sort: PSS]",
         SortMode::Rss => " [Sort: RSS]",
         SortMode::Shared => " [Sort: Shared]",
-        SortMode::Pid => " [Sort: PID]",
+        SortMode::Pid => {
+            if app.grouped {
+                " [Sort: Count]"
+            } else {
+                " [Sort: PID]"
+            }
+        }
+    };
+
+    let group_indicator = if app.grouped { " [Grouped]" } else { "" };
+    let filter_indicator = if !app.search_query.is_empty() {
+        format!(" [Filter: {}]", app.search_query)
+    } else {
+        String::new()
+    };
+
+    let current_pos = if app.display_rows.is_empty() {
+        0
+    } else {
+        app.selected_index + 1
     };
 
     let title = format!(
-        "Processes ({}/{}){}",
-        app.scroll_offset.min(app.state.processes.len()),
-        app.state.processes.len(),
-        sort_indicator
+        "Processes ({}/{}){}{}{}",
+        current_pos,
+        app.display_rows.len(),
+        sort_indicator,
+        group_indicator,
+        filter_indicator
     );
+
+    let highlight_style = Style::default()
+        .bg(COLOR_SECONDARY)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
 
     let table = Table::new(
         rows,
@@ -279,9 +449,10 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &App) {
         ],
     )
     .header(header)
+    .highlight_style(highlight_style)
     .block(Block::default().borders(Borders::ALL).title(title));
 
-    f.render_widget(table, area);
+    f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
 fn draw_memory_map(f: &mut Frame, area: Rect, app: &App) {
@@ -388,6 +559,22 @@ fn draw_shared_view(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
+    let secondary = Style::default().fg(COLOR_SECONDARY);
+
+    if app.searching {
+        let search_line = vec![Line::from(vec![
+            Span::styled("Search: ", secondary.add_modifier(Modifier::BOLD)),
+            Span::raw(&app.search_query),
+            Span::styled("_", secondary),
+            Span::raw("  (Enter: lock filter | Esc: clear)"),
+        ])];
+
+        let para = Paragraph::new(search_line)
+            .block(Block::default().borders(Borders::ALL).title("Filter"));
+        f.render_widget(para, area);
+        return;
+    }
+
     let view_name = match app.view_mode {
         ViewMode::Processes => "map",
         ViewMode::MemoryMap => "shared",
@@ -395,9 +582,9 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let help_text = vec![Line::from(vec![
-        Span::raw("q: quit | n: next sort | v: "),
-        Span::styled(view_name, Style::default().fg(COLOR_SECONDARY)),
-        Span::raw(" view | up/down: scroll | PgUp/PgDn: page"),
+        Span::raw("q: quit | /: search | g: group | k: kill | n: sort | v: "),
+        Span::styled(view_name, secondary),
+        Span::raw(" | up/down: select"),
     ])];
 
     let para =

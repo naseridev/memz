@@ -7,9 +7,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+enum Command {
+    Kill(Vec<u32>),
+    Shutdown,
+}
+
 pub struct Engine {
     state_rx: Receiver<AnalyzedState>,
-    shutdown_tx: Option<Sender<()>>,
+    cmd_tx: Option<Sender<Command>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -19,7 +24,7 @@ impl Engine {
         let mut analyzer = Analyzer::new();
 
         let (state_tx, state_rx) = mpsc::sync_channel(1);
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
 
         let worker = thread::spawn(move || {
             loop {
@@ -28,8 +33,11 @@ impl Engine {
                     let _ = state_tx.try_send(analyzer.get_state());
                 }
 
-                match shutdown_rx.recv_timeout(tick_rate) {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                match cmd_rx.recv_timeout(tick_rate) {
+                    Ok(Command::Kill(pids)) => {
+                        collector.kill_pids(&pids);
+                    }
+                    Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
@@ -37,7 +45,7 @@ impl Engine {
 
         Ok(Self {
             state_rx,
-            shutdown_tx: Some(shutdown_tx),
+            cmd_tx: Some(cmd_tx),
             worker: Some(worker),
         })
     }
@@ -49,12 +57,20 @@ impl Engine {
         }
         latest
     }
+
+    pub fn kill_pids(&self, pids: Vec<u32>) {
+        if !pids.is_empty()
+            && let Some(tx) = &self.cmd_tx
+        {
+            let _ = tx.send(Command::Kill(pids));
+        }
+    }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+        if let Some(tx) = self.cmd_tx.take() {
+            let _ = tx.send(Command::Shutdown);
         }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
