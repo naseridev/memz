@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
-use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[derive(Debug, Clone, Default)]
 pub struct MemorySnapshot {
@@ -14,6 +14,8 @@ pub struct MemorySnapshot {
 pub struct ProcessMemory {
     pub pid: u32,
     pub name: String,
+    pub exe: String,
+    pub cmdline: String,
     pub rss_kb: u64,
     pub pss_kb: u64,
     pub shared_clean_kb: u64,
@@ -21,6 +23,14 @@ pub struct ProcessMemory {
     pub private_clean_kb: u64,
     pub private_dirty_kb: u64,
     pub swap_kb: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryBreakdown {
+    pub heap_kb: u64,
+    pub stack_kb: u64,
+    pub anon_kb: u64,
+    pub libs_kb: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,13 +77,34 @@ impl Collector {
         }
     }
 
+    pub fn inspect_pids(&self, pids: &[u32]) -> MemoryBreakdown {
+        let mut total = MemoryBreakdown::default();
+
+        for &pid in pids {
+            if let Some(b) = Self::parse_smaps_breakdown(pid) {
+                total.heap_kb = total.heap_kb.saturating_add(b.heap_kb);
+                total.stack_kb = total.stack_kb.saturating_add(b.stack_kb);
+                total.anon_kb = total.anon_kb.saturating_add(b.anon_kb);
+                total.libs_kb = total.libs_kb.saturating_add(b.libs_kb);
+            } else if let Some(proc_info) = self.sys.process(Pid::from_u32(pid)) {
+                let rss_kb = proc_info.memory() / 1024;
+                total.anon_kb = total.anon_kb.saturating_add(rss_kb);
+            }
+        }
+
+        total
+    }
+
     pub fn collect(&mut self) -> Result<MemorySnapshot> {
         self.sys
             .refresh_memory_specifics(MemoryRefreshKind::everything());
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_memory(),
+            ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet),
         );
 
         let system = self.collect_system_memory();
@@ -143,20 +174,30 @@ impl Collector {
                 let upid = pid.as_u32();
                 let vmem_kb = proc_info.virtual_memory() / 1024;
 
-                let raw_name = proc_info.name().to_string_lossy();
-                let name = raw_name
-                    .trim()
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .collect::<String>();
-
+                let name = sanitize_text(&proc_info.name().to_string_lossy());
                 let proc_name = if name.is_empty() {
                     format!("[{}]", upid)
                 } else {
                     name
                 };
 
-                if let Some(detailed) = Self::read_smaps(upid, proc_name.clone()) {
+                let exe = proc_info
+                    .exe()
+                    .map(|p| sanitize_text(&p.to_string_lossy()))
+                    .unwrap_or_default();
+
+                let cmdline = sanitize_text(
+                    &proc_info
+                        .cmd()
+                        .iter()
+                        .map(|s| s.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+
+                if let Some(mut detailed) = Self::read_smaps(upid, proc_name.clone()) {
+                    detailed.exe = exe;
+                    detailed.cmdline = cmdline;
                     return Some(detailed);
                 }
 
@@ -165,6 +206,8 @@ impl Collector {
                 Some(ProcessMemory {
                     pid: upid,
                     name: proc_name,
+                    exe,
+                    cmdline,
                     rss_kb,
                     pss_kb: rss_kb,
                     shared_clean_kb: 0,
@@ -208,6 +251,43 @@ impl Collector {
         } else {
             Some(mem)
         }
+    }
+
+    fn parse_smaps_breakdown(pid: u32) -> Option<MemoryBreakdown> {
+        let content = fs::read_to_string(format!("/proc/{pid}/smaps")).ok()?;
+        let mut breakdown = MemoryBreakdown::default();
+
+        let mut current_bucket = 2u8;
+
+        for line in content.lines() {
+            if line.contains('-') && line.split_whitespace().count() >= 5 {
+                let path_part = line.split_whitespace().nth(5).unwrap_or("");
+                current_bucket = if path_part == "[heap]" {
+                    0
+                } else if path_part.starts_with("[stack") {
+                    1
+                } else if path_part.starts_with('/') {
+                    3
+                } else {
+                    2
+                };
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("Pss:")
+                && let Some(val_str) = rest.split_whitespace().next()
+                && let Ok(val) = val_str.parse::<u64>()
+            {
+                match current_bucket {
+                    0 => breakdown.heap_kb = breakdown.heap_kb.saturating_add(val),
+                    1 => breakdown.stack_kb = breakdown.stack_kb.saturating_add(val),
+                    3 => breakdown.libs_kb = breakdown.libs_kb.saturating_add(val),
+                    _ => breakdown.anon_kb = breakdown.anon_kb.saturating_add(val),
+                }
+            }
+        }
+
+        Some(breakdown)
     }
 
     fn collect_numa_info(&self) -> Vec<NumaNode> {
@@ -259,4 +339,11 @@ impl Collector {
         nodes.sort_by_key(|n| n.node_id);
         nodes
     }
+}
+
+fn sanitize_text(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }

@@ -32,6 +32,14 @@ impl Tui {
         loop {
             if let Some(state) = self.engine.try_recv() {
                 self.app.update_data(state);
+                if self.app.is_inspecting() {
+                    self.engine.inspect_pids(self.app.selected_pids());
+                }
+                needs_redraw = true;
+            }
+
+            if let Some(breakdown) = self.engine.try_recv_inspect() {
+                self.app.update_breakdown(breakdown);
                 needs_redraw = true;
             }
 
@@ -66,10 +74,40 @@ impl Tui {
                                     }
                                     _ => {}
                                 }
+                            } else if self.app.is_inspecting() {
+                                match k.code {
+                                    KeyCode::Esc
+                                    | KeyCode::Enter
+                                    | KeyCode::Char('i')
+                                    | KeyCode::Char('I') => {
+                                        self.app.close_inspector();
+                                        self.engine.inspect_pids(Vec::new());
+                                    }
+                                    KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
+                                    KeyCode::Char('k') | KeyCode::Char('K') => {
+                                        let pids = self.app.selected_pids();
+                                        self.engine.kill_pids(pids);
+                                    }
+                                    KeyCode::Up => {
+                                        self.app.scroll_up();
+                                        self.engine.inspect_pids(self.app.selected_pids());
+                                    }
+                                    KeyCode::Down => {
+                                        self.app.scroll_down();
+                                        self.engine.inspect_pids(self.app.selected_pids());
+                                    }
+                                    _ => {}
+                                }
                             } else {
                                 match k.code {
                                     KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
                                     KeyCode::Esc => self.app.clear_search(),
+                                    KeyCode::Enter | KeyCode::Char('i') | KeyCode::Char('I') => {
+                                        self.app.open_inspector();
+                                        if self.app.is_inspecting() {
+                                            self.engine.inspect_pids(self.app.selected_pids());
+                                        }
+                                    }
                                     KeyCode::Char('/') => self.app.start_search(),
                                     KeyCode::Char('g') | KeyCode::Char('G') => {
                                         self.app.toggle_group();

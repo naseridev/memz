@@ -1,15 +1,19 @@
-use crate::analyzer::{AnalyzedState, ProcessStats};
+use crate::{
+    analyzer::{AnalyzedState, ProcessStats, detect_leak},
+    collector::MemoryBreakdown,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Clear, Paragraph, Row, Sparkline, Table, TableState},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 const COLOR_PRIMARY: Color = Color::White;
 const COLOR_SECONDARY: Color = Color::Rgb(255, 165, 0);
+const COLOR_ALERT: Color = Color::LightRed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
@@ -33,12 +37,17 @@ struct DisplayRow {
     pid: u32,
     count: usize,
     name: String,
+    exe: String,
+    cmdline: String,
     pss_kb: u64,
     rss_kb: u64,
     shared_kb: u64,
     private_kb: u64,
     swap_kb: u64,
     pss_delta_kb: i64,
+    pss_history: Vec<u64>,
+    is_leaking: bool,
+    leak_rate_kb: u64,
     pids: Vec<u32>,
 }
 
@@ -46,10 +55,12 @@ struct DisplayRow {
 pub struct App {
     state: AnalyzedState,
     display_rows: Vec<DisplayRow>,
+    inspector_breakdown: Option<MemoryBreakdown>,
     sort_mode: SortMode,
     view_mode: ViewMode,
     grouped: bool,
     searching: bool,
+    inspecting: bool,
     search_query: String,
     selected_index: usize,
     table_state: TableState,
@@ -69,8 +80,29 @@ impl App {
         self.rebuild_display_rows();
     }
 
+    pub fn update_breakdown(&mut self, breakdown: MemoryBreakdown) {
+        self.inspector_breakdown = Some(breakdown);
+    }
+
     pub fn is_searching(&self) -> bool {
         self.searching
+    }
+
+    pub fn is_inspecting(&self) -> bool {
+        self.inspecting
+    }
+
+    pub fn open_inspector(&mut self) {
+        if !self.display_rows.is_empty() {
+            self.view_mode = ViewMode::Processes;
+            self.inspecting = true;
+            self.inspector_breakdown = None;
+        }
+    }
+
+    pub fn close_inspector(&mut self) {
+        self.inspecting = false;
+        self.inspector_breakdown = None;
     }
 
     pub fn start_search(&mut self) {
@@ -143,18 +175,21 @@ impl App {
 
     pub fn scroll_up(&mut self) {
         self.selected_index = self.selected_index.saturating_sub(1);
+        self.inspector_breakdown = None;
         self.sync_table_state();
     }
 
     pub fn scroll_down(&mut self) {
         if !self.display_rows.is_empty() && self.selected_index + 1 < self.display_rows.len() {
             self.selected_index += 1;
+            self.inspector_breakdown = None;
             self.sync_table_state();
         }
     }
 
     pub fn page_up(&mut self) {
         self.selected_index = self.selected_index.saturating_sub(self.visible_rows.max(1));
+        self.inspector_breakdown = None;
         self.sync_table_state();
     }
 
@@ -164,6 +199,7 @@ impl App {
                 .selected_index
                 .saturating_add(self.visible_rows.max(1))
                 .min(self.display_rows.len() - 1);
+            self.inspector_breakdown = None;
             self.sync_table_state();
         }
     }
@@ -191,18 +227,40 @@ impl App {
                         pid: proc.pid,
                         count: 0,
                         name: proc.name.clone(),
+                        exe: proc.exe.clone(),
+                        cmdline: proc.cmdline.clone(),
                         ..Default::default()
                     });
                 entry.pid = entry.pid.min(proc.pid);
                 entry.count += 1;
+                if entry.exe.is_empty() && !proc.exe.is_empty() {
+                    entry.exe = proc.exe.clone();
+                }
+                if entry.cmdline.is_empty() && !proc.cmdline.is_empty() {
+                    entry.cmdline = proc.cmdline.clone();
+                }
                 entry.pss_kb = entry.pss_kb.saturating_add(proc.pss_kb);
                 entry.rss_kb = entry.rss_kb.saturating_add(proc.rss_kb);
                 entry.shared_kb = entry.shared_kb.saturating_add(proc.shared_kb);
                 entry.private_kb = entry.private_kb.saturating_add(proc.private_kb);
                 entry.swap_kb = entry.swap_kb.saturating_add(proc.swap_kb);
                 entry.pss_delta_kb = entry.pss_delta_kb.saturating_add(proc.pss_delta_kb);
+                entry.is_leaking |= proc.is_leaking;
+                entry.leak_rate_kb = entry.leak_rate_kb.saturating_add(proc.leak_rate_kb);
                 entry.pids.push(proc.pid);
+
+                merge_history(&mut entry.pss_history, &proc.pss_history);
             }
+
+            for row in groups.values_mut() {
+                if !row.is_leaking {
+                    let deque: VecDeque<u64> = row.pss_history.iter().copied().collect();
+                    let (leaking, rate) = detect_leak(&deque);
+                    row.is_leaking = leaking;
+                    row.leak_rate_kb = rate;
+                }
+            }
+
             groups.into_values().collect()
         } else {
             filtered
@@ -211,12 +269,17 @@ impl App {
                     pid: p.pid,
                     count: 1,
                     name: p.name.clone(),
+                    exe: p.exe.clone(),
+                    cmdline: p.cmdline.clone(),
                     pss_kb: p.pss_kb,
                     rss_kb: p.rss_kb,
                     shared_kb: p.shared_kb,
                     private_kb: p.private_kb,
                     swap_kb: p.swap_kb,
                     pss_delta_kb: p.pss_delta_kb,
+                    pss_history: p.pss_history.clone(),
+                    is_leaking: p.is_leaking,
+                    leak_rate_kb: p.leak_rate_kb,
                     pids: vec![p.pid],
                 })
                 .collect()
@@ -246,6 +309,7 @@ impl App {
         if self.display_rows.is_empty() {
             self.selected_index = 0;
             self.table_state.select(None);
+            self.inspecting = false;
         } else {
             self.selected_index = self.selected_index.min(self.display_rows.len() - 1);
             self.table_state.select(Some(self.selected_index));
@@ -253,8 +317,28 @@ impl App {
     }
 }
 
+fn merge_history(target: &mut Vec<u64>, source: &[u64]) {
+    if source.is_empty() {
+        return;
+    }
+    if target.len() < source.len() {
+        let diff = source.len() - target.len();
+        let mut new_target = vec![0u64; diff];
+        new_target.append(target);
+        *target = new_target;
+    }
+    let offset = target.len() - source.len();
+    for (t, &s) in target.iter_mut().skip(offset).zip(source.iter()) {
+        *t = t.saturating_add(s);
+    }
+}
+
 fn to_gib(kb: u64) -> f64 {
     kb as f64 / 1024.0 / 1024.0
+}
+
+fn to_mib(kb: u64) -> f64 {
+    kb as f64 / 1024.0
 }
 
 fn pct(part: u64, total: u64) -> f64 {
@@ -287,11 +371,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     draw_help(f, chunks[2], app);
+
+    if app.inspecting {
+        draw_inspector_modal(f, f.area(), app);
+    }
 }
 
 fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
     let sys = &app.state.system;
     let label_style = Style::default().fg(COLOR_SECONDARY);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
 
     let lines = vec![
         Line::from(vec![
@@ -338,7 +431,18 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
             .borders(Borders::ALL)
             .title("System Memory"),
     );
-    f.render_widget(para, area);
+    f.render_widget(para, cols[0]);
+
+    let sparkline = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Memory Trend (60s)"),
+        )
+        .data(&sys.history_used_kb)
+        .max(sys.total_kb.max(1))
+        .style(Style::default().fg(COLOR_SECONDARY));
+    f.render_widget(sparkline, cols[1]);
 }
 
 fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
@@ -358,10 +462,16 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
     .height(1)
     .bottom_margin(1);
 
+    let mut leak_count = 0usize;
+
     let rows: Vec<Row> = app
         .display_rows
         .iter()
         .map(|proc| {
+            if proc.is_leaking {
+                leak_count += 1;
+            }
+
             let delta_mb = proc.pss_delta_kb / 1024;
             let delta_str = if delta_mb != 0 {
                 format!("{:+}", delta_mb)
@@ -369,7 +479,11 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
                 String::from("-")
             };
 
-            let style = if proc.pss_delta_kb.saturating_abs() > 10240 {
+            let style = if proc.is_leaking {
+                Style::default()
+                    .fg(COLOR_ALERT)
+                    .add_modifier(Modifier::BOLD)
+            } else if proc.pss_delta_kb.saturating_abs() > 10240 {
                 Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -381,9 +495,15 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
                 proc.pid.to_string()
             };
 
+            let display_name = if proc.is_leaking {
+                format!("{} [LEAK?]", proc.name)
+            } else {
+                proc.name.clone()
+            };
+
             Row::new([
                 id_col,
-                proc.name.clone(),
+                display_name,
                 format!("{} M", proc.pss_kb / 1024),
                 format!("{} M", proc.rss_kb / 1024),
                 format!("{} M", proc.shared_kb / 1024),
@@ -414,6 +534,11 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         String::new()
     };
+    let leak_indicator = if leak_count > 0 {
+        format!(" [Leaks: {}]", leak_count)
+    } else {
+        String::new()
+    };
 
     let current_pos = if app.display_rows.is_empty() {
         0
@@ -422,12 +547,13 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     let title = format!(
-        "Processes ({}/{}){}{}{}",
+        "Processes ({}/{}){}{}{}{}",
         current_pos,
         app.display_rows.len(),
         sort_indicator,
         group_indicator,
-        filter_indicator
+        filter_indicator,
+        leak_indicator
     );
 
     let highlight_style = Style::default()
@@ -453,6 +579,155 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
     .block(Block::default().borders(Borders::ALL).title(title));
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn draw_inspector_modal(f: &mut Frame, area: Rect, app: &App) {
+    let Some(proc) = app.display_rows.get(app.selected_index) else {
+        return;
+    };
+
+    let modal_area = centered_rect(76, 82, area);
+    f.render_widget(Clear, modal_area);
+
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLOR_SECONDARY))
+        .title("Process Memory Inspector (Enter/Esc: close | Up/Down: switch | k: kill)");
+
+    let inner_area = outer_block.inner(modal_area);
+    f.render_widget(outer_block, modal_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(11), Constraint::Length(6)])
+        .split(inner_area);
+
+    let label = Style::default()
+        .fg(COLOR_SECONDARY)
+        .add_modifier(Modifier::BOLD);
+
+    let exe_str = if proc.exe.is_empty() {
+        "N/A"
+    } else {
+        &proc.exe
+    };
+    let cmd_str = if proc.cmdline.is_empty() {
+        &proc.name
+    } else {
+        &proc.cmdline
+    };
+
+    let leak_span = if proc.is_leaking {
+        Span::styled(
+            format!("LEAK DETECTED (+{} KB/s)", proc.leak_rate_kb),
+            Style::default()
+                .fg(COLOR_ALERT)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("Stable", Style::default().fg(Color::Green))
+    };
+
+    let breakdown = app.inspector_breakdown.clone().unwrap_or(MemoryBreakdown {
+        heap_kb: 0,
+        stack_kb: 0,
+        anon_kb: proc.private_kb,
+        libs_kb: proc.shared_kb,
+    });
+
+    let total_pss = proc.pss_kb.max(1);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Process: ", label),
+            Span::raw(format!(
+                "{} (PID: {}, Instances: {})  ",
+                proc.name, proc.pid, proc.count
+            )),
+            Span::styled("Status: ", label),
+            leak_span,
+        ]),
+        Line::from(vec![
+            Span::styled("Executable: ", label),
+            Span::raw(exe_str),
+        ]),
+        Line::from(vec![Span::styled("Cmdline: ", label), Span::raw(cmd_str)]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Summary: ", label),
+            Span::raw(format!(
+                "PSS: {:.1} MiB | RSS: {:.1} MiB | Private: {:.1} MiB | Shared: {:.1} MiB | Swap: {:.1} MiB",
+                to_mib(proc.pss_kb),
+                to_mib(proc.rss_kb),
+                to_mib(proc.private_kb),
+                to_mib(proc.shared_kb),
+                to_mib(proc.swap_kb),
+            )),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Memory Region Breakdown (PSS):", label)),
+    ];
+
+    let segments = [
+        ("Heap", breakdown.heap_kb, COLOR_SECONDARY),
+        ("Stack", breakdown.stack_kb, COLOR_PRIMARY),
+        ("Anonymous", breakdown.anon_kb, COLOR_PRIMARY),
+        ("Shared Libs", breakdown.libs_kb, COLOR_SECONDARY),
+        ("Swap", proc.swap_kb, COLOR_PRIMARY),
+    ];
+
+    for (seg_name, kb, color) in segments {
+        let seg_pct = pct(kb, total_pss);
+        let bar_width = ((seg_pct.clamp(0.0, 100.0) / 100.0) * 32.0) as usize;
+        let style = Style::default().fg(color);
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:13} ", seg_name), style),
+            Span::raw(format!("{:8.1} MiB ({:5.1}%) ", to_mib(kb), seg_pct)),
+            Span::styled("#".repeat(bar_width), style),
+        ]));
+    }
+
+    let info_para = Paragraph::new(lines);
+    f.render_widget(info_para, chunks[0]);
+
+    let max_pss = proc.pss_history.iter().copied().max().unwrap_or(1).max(1);
+    let spark_color = if proc.is_leaking {
+        COLOR_ALERT
+    } else {
+        COLOR_SECONDARY
+    };
+
+    let sparkline = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Process PSS Trend (last 60s)"),
+        )
+        .data(&proc.pss_history)
+        .max(max_pss)
+        .style(Style::default().fg(spark_color));
+    f.render_widget(sparkline, chunks[1]);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn draw_memory_map(f: &mut Frame, area: Rect, app: &App) {
@@ -582,9 +857,8 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let help_text = vec![Line::from(vec![
-        Span::raw("q: quit | /: search | g: group | k: kill | n: sort | v: "),
+        Span::raw("q: quit | Enter: inspect | /: search | g: group | k: kill | n: sort | v: "),
         Span::styled(view_name, secondary),
-        Span::raw(" | up/down: select"),
     ])];
 
     let para =
