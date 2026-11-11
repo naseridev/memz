@@ -44,6 +44,8 @@ pub struct SystemMemory {
     pub swap_free_kb: u64,
     pub slab_kb: u64,
     pub page_tables_kb: u64,
+    pub psi_some_avg10: f64,
+    pub psi_full_avg10: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -152,6 +154,26 @@ impl Collector {
                 .total_kb
                 .saturating_sub(used_kb)
                 .saturating_sub(mem.free_kb);
+        }
+
+        if let Ok(psi_content) = fs::read_to_string("/proc/pressure/memory") {
+            for line in psi_content.lines() {
+                let mut parts = line.split_whitespace();
+                let Some(kind) = parts.next() else {
+                    continue;
+                };
+                for token in parts {
+                    if let Some(val_str) = token.strip_prefix("avg10=")
+                        && let Ok(val) = val_str.parse::<f64>()
+                    {
+                        match kind {
+                            "some" => mem.psi_some_avg10 = val,
+                            "full" => mem.psi_full_avg10 = val,
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
 
         mem

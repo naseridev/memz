@@ -4,6 +4,14 @@ use std::collections::{HashMap, VecDeque};
 const MAX_HISTORY_SAMPLES: usize = 60;
 const MIN_LEAK_SAMPLES: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PressureLevel {
+    #[default]
+    Healthy,
+    Warning,
+    Critical,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzedState {
     pub processes: Vec<ProcessStats>,
@@ -39,9 +47,13 @@ pub struct SystemStats {
     pub buffers_kb: u64,
     pub swap_total_kb: u64,
     pub swap_used_kb: u64,
+    pub swap_rate_kb: i64,
     pub total_process_pss_kb: u64,
     pub total_process_rss_kb: u64,
     pub history_used_kb: Vec<u64>,
+    pub psi_some_avg10: f64,
+    pub psi_full_avg10: f64,
+    pub pressure_level: PressureLevel,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,6 +81,7 @@ pub struct Analyzer {
     last_snapshot: Option<MemorySnapshot>,
     process_history: HashMap<u32, VecDeque<u64>>,
     system_history: VecDeque<u64>,
+    last_swap_used_kb: Option<u64>,
 }
 
 impl Analyzer {
@@ -165,6 +178,40 @@ impl Analyzer {
         }
         self.system_history.push_back(used_kb);
 
+        let swap_used_kb = system.swap_total_kb.saturating_sub(system.swap_free_kb);
+        let prev_swap = self.last_swap_used_kb.unwrap_or(swap_used_kb);
+        self.last_swap_used_kb = Some(swap_used_kb);
+
+        let swap_rate_kb = if swap_used_kb >= prev_swap {
+            (swap_used_kb - prev_swap).min(i64::MAX as u64) as i64
+        } else {
+            -((prev_swap - swap_used_kb).min(i64::MAX as u64) as i64)
+        };
+
+        let avail_pct = if system.total_kb > 0 {
+            (system.available_kb as f64 / system.total_kb as f64) * 100.0
+        } else {
+            100.0
+        };
+
+        let swap_thrashing = swap_rate_kb.unsigned_abs() >= 4096;
+
+        let pressure_level = if system.psi_full_avg10 >= 5.0
+            || system.psi_some_avg10 >= 25.0
+            || avail_pct < 5.0
+            || (avail_pct < 12.0 && swap_thrashing)
+        {
+            PressureLevel::Critical
+        } else if system.psi_full_avg10 >= 1.0
+            || system.psi_some_avg10 >= 5.0
+            || avail_pct < 15.0
+            || swap_thrashing
+        {
+            PressureLevel::Warning
+        } else {
+            PressureLevel::Healthy
+        };
+
         SystemStats {
             total_kb: system.total_kb,
             used_kb,
@@ -172,10 +219,14 @@ impl Analyzer {
             cached_kb: system.cached_kb,
             buffers_kb: system.buffers_kb,
             swap_total_kb: system.swap_total_kb,
-            swap_used_kb: system.swap_total_kb.saturating_sub(system.swap_free_kb),
+            swap_used_kb,
+            swap_rate_kb,
             total_process_pss_kb: total_pss,
             total_process_rss_kb: total_rss,
             history_used_kb: self.system_history.iter().copied().collect(),
+            psi_some_avg10: system.psi_some_avg10,
+            psi_full_avg10: system.psi_full_avg10,
+            pressure_level,
         }
     }
 

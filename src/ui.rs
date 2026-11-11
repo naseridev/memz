@@ -1,5 +1,5 @@
 use crate::{
-    analyzer::{AnalyzedState, ProcessStats, detect_leak},
+    analyzer::{AnalyzedState, PressureLevel, ProcessStats, detect_leak},
     collector::MemoryBreakdown,
 };
 use ratatui::{
@@ -14,14 +14,30 @@ use std::collections::{HashMap, VecDeque};
 const COLOR_PRIMARY: Color = Color::White;
 const COLOR_SECONDARY: Color = Color::Rgb(255, 165, 0);
 const COLOR_ALERT: Color = Color::LightRed;
+const COLOR_HEALTHY: Color = Color::LightGreen;
+
+const TABLE_CONSTRAINTS: [Constraint; 8] = [
+    Constraint::Length(7),
+    Constraint::Min(20),
+    Constraint::Length(9),
+    Constraint::Length(9),
+    Constraint::Length(9),
+    Constraint::Length(10),
+    Constraint::Length(8),
+    Constraint::Length(9),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
+    Pid,
+    Name,
     #[default]
     Pss,
     Rss,
     Shared,
-    Pid,
+    Private,
+    Swap,
+    Delta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,6 +72,9 @@ pub struct App {
     state: AnalyzedState,
     display_rows: Vec<DisplayRow>,
     inspector_breakdown: Option<MemoryBreakdown>,
+    baseline_pids: HashMap<u32, u64>,
+    baseline_groups: HashMap<String, u64>,
+    baseline_system_pss_kb: Option<u64>,
     sort_mode: SortMode,
     view_mode: ViewMode,
     grouped: bool,
@@ -65,6 +84,8 @@ pub struct App {
     selected_index: usize,
     table_state: TableState,
     visible_rows: usize,
+    table_area: Rect,
+    modal_area: Rect,
 }
 
 impl App {
@@ -103,6 +124,24 @@ impl App {
     pub fn close_inspector(&mut self) {
         self.inspecting = false;
         self.inspector_breakdown = None;
+    }
+
+    pub fn toggle_baseline(&mut self) {
+        if self.baseline_system_pss_kb.is_some() {
+            self.baseline_pids.clear();
+            self.baseline_groups.clear();
+            self.baseline_system_pss_kb = None;
+        } else {
+            self.baseline_pids.clear();
+            self.baseline_groups.clear();
+            for proc in &self.state.processes {
+                self.baseline_pids.insert(proc.pid, proc.pss_kb);
+                let entry = self.baseline_groups.entry(proc.name.clone()).or_insert(0);
+                *entry = entry.saturating_add(proc.pss_kb);
+            }
+            self.baseline_system_pss_kb = Some(self.state.system.total_process_pss_kb);
+        }
+        self.rebuild_display_rows();
     }
 
     pub fn start_search(&mut self) {
@@ -158,8 +197,12 @@ impl App {
         self.sort_mode = match self.sort_mode {
             SortMode::Pss => SortMode::Rss,
             SortMode::Rss => SortMode::Shared,
-            SortMode::Shared => SortMode::Pid,
-            SortMode::Pid => SortMode::Pss,
+            SortMode::Shared => SortMode::Private,
+            SortMode::Private => SortMode::Swap,
+            SortMode::Swap => SortMode::Delta,
+            SortMode::Delta => SortMode::Pid,
+            SortMode::Pid => SortMode::Name,
+            SortMode::Name => SortMode::Pss,
         };
         self.selected_index = 0;
         self.rebuild_display_rows();
@@ -204,8 +247,102 @@ impl App {
         }
     }
 
+    pub fn handle_left_click(&mut self, col: u16, row: u16) -> bool {
+        if self.inspecting {
+            if !rect_contains(self.modal_area, col, row) {
+                self.close_inspector();
+                return true;
+            }
+            return false;
+        }
+
+        if self.view_mode != ViewMode::Processes || !rect_contains(self.table_area, col, row) {
+            return false;
+        }
+
+        let header_y = self.table_area.y.saturating_add(1);
+        if row == header_y {
+            let inner_header = Rect {
+                x: self.table_area.x.saturating_add(1),
+                y: header_y,
+                width: self.table_area.width.saturating_sub(2),
+                height: 1,
+            };
+            let col_rects = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(TABLE_CONSTRAINTS)
+                .spacing(1)
+                .split(inner_header);
+
+            let modes = [
+                SortMode::Pid,
+                SortMode::Name,
+                SortMode::Pss,
+                SortMode::Rss,
+                SortMode::Shared,
+                SortMode::Private,
+                SortMode::Swap,
+                SortMode::Delta,
+            ];
+
+            for (rect, mode) in col_rects.iter().zip(modes) {
+                if col >= rect.x && col < rect.right() {
+                    self.sort_mode = mode;
+                    self.selected_index = 0;
+                    self.rebuild_display_rows();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        let data_start_y = self.table_area.y.saturating_add(3);
+        let data_end_y = self.table_area.bottom().saturating_sub(1);
+        if row >= data_start_y && row < data_end_y {
+            let visual_idx = (row - data_start_y) as usize;
+            let target_idx = self.table_state.offset().saturating_add(visual_idx);
+            if target_idx < self.display_rows.len() {
+                if self.selected_index == target_idx {
+                    self.open_inspector();
+                } else {
+                    self.selected_index = target_idx;
+                    self.inspector_breakdown = None;
+                    self.sync_table_state();
+                }
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn handle_right_click(&mut self, col: u16, row: u16) -> bool {
+        if self.inspecting {
+            self.close_inspector();
+            return true;
+        }
+
+        if self.view_mode == ViewMode::Processes && rect_contains(self.table_area, col, row) {
+            let data_start_y = self.table_area.y.saturating_add(3);
+            let data_end_y = self.table_area.bottom().saturating_sub(1);
+            if row >= data_start_y && row < data_end_y {
+                let visual_idx = (row - data_start_y) as usize;
+                let target_idx = self.table_state.offset().saturating_add(visual_idx);
+                if target_idx < self.display_rows.len() {
+                    self.selected_index = target_idx;
+                    self.sync_table_state();
+                    self.open_inspector();
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     fn rebuild_display_rows(&mut self) {
         let query = self.search_query.trim().to_lowercase();
+        let has_baseline = self.baseline_system_pss_kb.is_some();
 
         let filtered: Vec<&ProcessStats> = self
             .state
@@ -253,6 +390,10 @@ impl App {
             }
 
             for row in groups.values_mut() {
+                if has_baseline {
+                    let base = self.baseline_groups.get(&row.name).copied().unwrap_or(0);
+                    row.pss_delta_kb = diff_kb(row.pss_kb, base);
+                }
                 if !row.is_leaking {
                     let deque: VecDeque<u64> = row.pss_history.iter().copied().collect();
                     let (leaking, rate) = detect_leak(&deque);
@@ -265,22 +406,31 @@ impl App {
         } else {
             filtered
                 .into_iter()
-                .map(|p| DisplayRow {
-                    pid: p.pid,
-                    count: 1,
-                    name: p.name.clone(),
-                    exe: p.exe.clone(),
-                    cmdline: p.cmdline.clone(),
-                    pss_kb: p.pss_kb,
-                    rss_kb: p.rss_kb,
-                    shared_kb: p.shared_kb,
-                    private_kb: p.private_kb,
-                    swap_kb: p.swap_kb,
-                    pss_delta_kb: p.pss_delta_kb,
-                    pss_history: p.pss_history.clone(),
-                    is_leaking: p.is_leaking,
-                    leak_rate_kb: p.leak_rate_kb,
-                    pids: vec![p.pid],
+                .map(|p| {
+                    let pss_delta_kb = if has_baseline {
+                        let base = self.baseline_pids.get(&p.pid).copied().unwrap_or(0);
+                        diff_kb(p.pss_kb, base)
+                    } else {
+                        p.pss_delta_kb
+                    };
+
+                    DisplayRow {
+                        pid: p.pid,
+                        count: 1,
+                        name: p.name.clone(),
+                        exe: p.exe.clone(),
+                        cmdline: p.cmdline.clone(),
+                        pss_kb: p.pss_kb,
+                        rss_kb: p.rss_kb,
+                        shared_kb: p.shared_kb,
+                        private_kb: p.private_kb,
+                        swap_kb: p.swap_kb,
+                        pss_delta_kb,
+                        pss_history: p.pss_history.clone(),
+                        is_leaking: p.is_leaking,
+                        leak_rate_kb: p.leak_rate_kb,
+                        pids: vec![p.pid],
+                    }
                 })
                 .collect()
         };
@@ -292,6 +442,17 @@ impl App {
                 .shared_kb
                 .cmp(&a.shared_kb)
                 .then_with(|| a.pid.cmp(&b.pid)),
+            SortMode::Private => b
+                .private_kb
+                .cmp(&a.private_kb)
+                .then_with(|| a.pid.cmp(&b.pid)),
+            SortMode::Swap => b.swap_kb.cmp(&a.swap_kb).then_with(|| a.pid.cmp(&b.pid)),
+            SortMode::Delta => b
+                .pss_delta_kb
+                .saturating_abs()
+                .cmp(&a.pss_delta_kb.saturating_abs())
+                .then_with(|| b.pss_kb.cmp(&a.pss_kb)),
+            SortMode::Name => a.name.cmp(&b.name).then_with(|| b.pss_kb.cmp(&a.pss_kb)),
             SortMode::Pid => {
                 if self.grouped {
                     b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name))
@@ -314,6 +475,18 @@ impl App {
             self.selected_index = self.selected_index.min(self.display_rows.len() - 1);
             self.table_state.select(Some(self.selected_index));
         }
+    }
+}
+
+fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.right() && row >= r.y && row < r.bottom()
+}
+
+fn diff_kb(current: u64, base: u64) -> i64 {
+    if current >= base {
+        (current - base).min(i64::MAX as u64) as i64
+    } else {
+        -((base - current).min(i64::MAX as u64) as i64)
     }
 }
 
@@ -353,12 +526,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(f.area());
 
+    app.table_area = chunks[1];
     app.visible_rows = chunks[1].height.saturating_sub(4) as usize;
     app.sync_table_state();
 
@@ -373,7 +547,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_help(f, chunks[2], app);
 
     if app.inspecting {
-        draw_inspector_modal(f, f.area(), app);
+        app.modal_area = centered_rect(76, 82, f.area());
+        draw_inspector_modal(f, app.modal_area, app);
     }
 }
 
@@ -385,6 +560,44 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
+
+    let (pressure_text, pressure_style) = match sys.pressure_level {
+        PressureLevel::Healthy => ("HEALTHY", Style::default().fg(COLOR_HEALTHY)),
+        PressureLevel::Warning => (
+            "WARNING",
+            Style::default()
+                .fg(COLOR_SECONDARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        PressureLevel::Critical => (
+            "CRITICAL / SWAPPING",
+            Style::default()
+                .fg(COLOR_ALERT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+
+    let swap_io_str = if sys.swap_rate_kb != 0 {
+        format!(" ({:+.1} MiB/s)", sys.swap_rate_kb as f64 / 1024.0)
+    } else {
+        String::new()
+    };
+
+    let psi_str = if sys.psi_some_avg10 > 0.0 || sys.psi_full_avg10 > 0.0 {
+        format!(
+            " | PSI some: {:.1}% full: {:.1}%",
+            sys.psi_some_avg10, sys.psi_full_avg10
+        )
+    } else {
+        String::new()
+    };
+
+    let baseline_str = if let Some(base_pss) = app.baseline_system_pss_kb {
+        let diff_mib = diff_kb(sys.total_process_pss_kb, base_pss) as f64 / 1024.0;
+        format!(" | BaseΔ: {:+.1} MiB", diff_mib)
+    } else {
+        String::new()
+    };
 
     let lines = vec![
         Line::from(vec![
@@ -398,31 +611,35 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("Available: ", label_style),
-            Span::raw(format!("{:.1} GiB", to_gib(sys.available_kb))),
-        ]),
-        Line::from(vec![
-            Span::styled("Cache/Buffers: ", label_style),
             Span::raw(format!(
-                "{:.1} GiB",
+                "{:.1} GiB | Cache/Buffers: {:.1} GiB",
+                to_gib(sys.available_kb),
                 to_gib(sys.cached_kb.saturating_add(sys.buffers_kb))
             )),
         ]),
         Line::from(vec![
             Span::styled("Swap: ", label_style),
             Span::raw(format!(
-                "{:.1} / {:.1} GiB ({:.1}%)",
+                "{:.1} / {:.1} GiB ({:.1}%){}",
                 to_gib(sys.swap_used_kb),
                 to_gib(sys.swap_total_kb),
-                pct(sys.swap_used_kb, sys.swap_total_kb)
+                pct(sys.swap_used_kb, sys.swap_total_kb),
+                swap_io_str
             )),
         ]),
         Line::from(vec![
             Span::styled("Process PSS: ", label_style),
             Span::raw(format!(
-                "{:.1} GiB (accurate) | RSS: {:.1} GiB (overcounted)",
+                "{:.1} GiB (accurate) | RSS: {:.1} GiB{}",
                 to_gib(sys.total_process_pss_kb),
                 to_gib(sys.total_process_rss_kb),
+                baseline_str
             )),
+        ]),
+        Line::from(vec![
+            Span::styled("Pressure: ", label_style),
+            Span::styled(pressure_text, pressure_style),
+            Span::raw(psi_str),
         ]),
     ];
 
@@ -433,6 +650,12 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
     );
     f.render_widget(para, cols[0]);
 
+    let spark_color = match sys.pressure_level {
+        PressureLevel::Critical => COLOR_ALERT,
+        PressureLevel::Warning => COLOR_SECONDARY,
+        PressureLevel::Healthy => COLOR_SECONDARY,
+    };
+
     let sparkline = Sparkline::default()
         .block(
             Block::default()
@@ -441,7 +664,7 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
         )
         .data(&sys.history_used_kb)
         .max(sys.total_kb.max(1))
-        .style(Style::default().fg(COLOR_SECONDARY));
+        .style(Style::default().fg(spark_color));
     f.render_widget(sparkline, cols[1]);
 }
 
@@ -451,10 +674,15 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
         .add_modifier(Modifier::BOLD);
 
     let first_col = if app.grouped { "Count" } else { "PID" };
+    let delta_col = if app.baseline_system_pss_kb.is_some() {
+        "BaseΔ"
+    } else {
+        "Delta"
+    };
 
     let header = Row::new(
         [
-            first_col, "Name", "PSS", "RSS", "Shared", "Private", "Swap", "Delta",
+            first_col, "Name", "PSS", "RSS", "Shared", "Private", "Swap", delta_col,
         ]
         .into_iter()
         .map(|h| Text::from(h).style(header_style)),
@@ -519,6 +747,10 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
         SortMode::Pss => " [Sort: PSS]",
         SortMode::Rss => " [Sort: RSS]",
         SortMode::Shared => " [Sort: Shared]",
+        SortMode::Private => " [Sort: Private]",
+        SortMode::Swap => " [Sort: Swap]",
+        SortMode::Delta => " [Sort: Delta]",
+        SortMode::Name => " [Sort: Name]",
         SortMode::Pid => {
             if app.grouped {
                 " [Sort: Count]"
@@ -529,6 +761,11 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     let group_indicator = if app.grouped { " [Grouped]" } else { "" };
+    let baseline_indicator = if app.baseline_system_pss_kb.is_some() {
+        " [Baseline]"
+    } else {
+        ""
+    };
     let filter_indicator = if !app.search_query.is_empty() {
         format!(" [Filter: {}]", app.search_query)
     } else {
@@ -547,11 +784,12 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     let title = format!(
-        "Processes ({}/{}){}{}{}{}",
+        "Processes ({}/{}){}{}{}{}{}",
         current_pos,
         app.display_rows.len(),
         sort_indicator,
         group_indicator,
+        baseline_indicator,
         filter_indicator,
         leak_indicator
     );
@@ -561,38 +799,27 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
         .fg(Color::Black)
         .add_modifier(Modifier::BOLD);
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(7),
-            Constraint::Min(20),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(8),
-        ],
-    )
-    .header(header)
-    .highlight_style(highlight_style)
-    .block(Block::default().borders(Borders::ALL).title(title));
+    let table = Table::new(rows, TABLE_CONSTRAINTS)
+        .header(header)
+        .highlight_style(highlight_style)
+        .block(Block::default().borders(Borders::ALL).title(title));
 
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-fn draw_inspector_modal(f: &mut Frame, area: Rect, app: &App) {
+fn draw_inspector_modal(f: &mut Frame, modal_area: Rect, app: &App) {
     let Some(proc) = app.display_rows.get(app.selected_index) else {
         return;
     };
 
-    let modal_area = centered_rect(76, 82, area);
     f.render_widget(Clear, modal_area);
 
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLOR_SECONDARY))
-        .title("Process Memory Inspector (Enter/Esc: close | Up/Down: switch | k: kill)");
+        .title(
+            "Process Memory Inspector (Enter/Esc/RightClick: close | Up/Down: switch | k: kill)",
+        );
 
     let inner_area = outer_block.inner(modal_area);
     f.render_widget(outer_block, modal_area);
@@ -625,7 +852,7 @@ fn draw_inspector_modal(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled("Stable", Style::default().fg(Color::Green))
+        Span::styled("Stable", Style::default().fg(COLOR_HEALTHY))
     };
 
     let breakdown = app.inspector_breakdown.clone().unwrap_or(MemoryBreakdown {
@@ -857,7 +1084,9 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let help_text = vec![Line::from(vec![
-        Span::raw("q: quit | Enter: inspect | /: search | g: group | k: kill | n: sort | v: "),
+        Span::raw(
+            "q: quit | Enter/Click: inspect | b/Space: baseline | /: search | g: group | k: kill | n: sort | v: ",
+        ),
         Span::styled(view_name, secondary),
     ])];
 

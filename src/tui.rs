@@ -1,7 +1,14 @@
 use crate::{engine::Engine, ui};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
+    execute,
+};
 use ratatui::DefaultTerminal;
+use std::io;
 use std::time::Duration;
 
 pub struct Tui {
@@ -18,6 +25,7 @@ impl Tui {
         }
 
         let terminal = ratatui::init();
+        let _ = execute!(io::stdout(), EnableMouseCapture);
 
         Ok(Self {
             terminal,
@@ -88,6 +96,11 @@ impl Tui {
                                         let pids = self.app.selected_pids();
                                         self.engine.kill_pids(pids);
                                     }
+                                    KeyCode::Char('b')
+                                    | KeyCode::Char('B')
+                                    | KeyCode::Char(' ') => {
+                                        self.app.toggle_baseline();
+                                    }
                                     KeyCode::Up => {
                                         self.app.scroll_up();
                                         self.engine.inspect_pids(self.app.selected_pids());
@@ -112,6 +125,11 @@ impl Tui {
                                     KeyCode::Char('g') | KeyCode::Char('G') => {
                                         self.app.toggle_group();
                                     }
+                                    KeyCode::Char('b')
+                                    | KeyCode::Char('B')
+                                    | KeyCode::Char(' ') => {
+                                        self.app.toggle_baseline();
+                                    }
                                     KeyCode::Char('k') | KeyCode::Char('K') => {
                                         let pids = self.app.selected_pids();
                                         self.engine.kill_pids(pids);
@@ -131,6 +149,43 @@ impl Tui {
                             }
                             needs_redraw = true;
                         }
+                        Event::Mouse(m) => match m.kind {
+                            MouseEventKind::ScrollUp => {
+                                self.app.scroll_up();
+                                if self.app.is_inspecting() {
+                                    self.engine.inspect_pids(self.app.selected_pids());
+                                }
+                                needs_redraw = true;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                self.app.scroll_down();
+                                if self.app.is_inspecting() {
+                                    self.engine.inspect_pids(self.app.selected_pids());
+                                }
+                                needs_redraw = true;
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if self.app.handle_left_click(m.column, m.row) {
+                                    if self.app.is_inspecting() {
+                                        self.engine.inspect_pids(self.app.selected_pids());
+                                    } else {
+                                        self.engine.inspect_pids(Vec::new());
+                                    }
+                                    needs_redraw = true;
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Right) => {
+                                if self.app.handle_right_click(m.column, m.row) {
+                                    if self.app.is_inspecting() {
+                                        self.engine.inspect_pids(self.app.selected_pids());
+                                    } else {
+                                        self.engine.inspect_pids(Vec::new());
+                                    }
+                                    needs_redraw = true;
+                                }
+                            }
+                            _ => {}
+                        },
                         Event::Resize(_, _) => {
                             needs_redraw = true;
                         }
@@ -148,6 +203,7 @@ impl Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
         ratatui::restore();
     }
 }
