@@ -1,9 +1,9 @@
-use crate::{engine::Engine, ui};
+use crate::{engine::Engine, state::App, ui};
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
 };
@@ -14,19 +14,17 @@ use std::time::Duration;
 pub struct Tui {
     terminal: DefaultTerminal,
     engine: Engine,
-    app: ui::App,
+    app: App,
 }
 
 impl Tui {
     pub fn new(engine: Engine) -> Result<Self> {
-        let mut app = ui::App::new();
+        let mut app = App::new();
         if let Some(initial) = engine.try_recv() {
             app.update_data(initial);
         }
-
         let terminal = ratatui::init();
         let _ = execute!(io::stdout(), EnableMouseCapture);
-
         Ok(Self {
             terminal,
             engine,
@@ -35,169 +33,171 @@ impl Tui {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        let mut needs_redraw = true;
-
+        let mut redraw = true;
         loop {
             if let Some(state) = self.engine.try_recv() {
                 self.app.update_data(state);
-                if self.app.is_inspecting() {
+                if self.app.inspecting {
                     self.engine.inspect_pids(self.app.selected_pids());
                 }
-                needs_redraw = true;
+                redraw = true;
             }
-
             if let Some(breakdown) = self.engine.try_recv_inspect() {
-                self.app.update_breakdown(breakdown);
-                needs_redraw = true;
+                self.app.inspector_breakdown = Some(breakdown);
+                redraw = true;
             }
-
-            if needs_redraw {
+            if redraw {
                 self.terminal.draw(|f| ui::draw(f, &mut self.app))?;
-                needs_redraw = false;
+                redraw = false;
             }
-
             if event::poll(Duration::from_millis(16))? {
                 loop {
                     match event::read()? {
                         Event::Key(k) if k.kind == KeyEventKind::Press => {
-                            if k.code == KeyCode::Char('c')
-                                && k.modifiers.contains(KeyModifiers::CONTROL)
-                            {
+                            if self.handle_key(k) {
                                 return Ok(());
                             }
-
-                            if self.app.is_searching() {
-                                match k.code {
-                                    KeyCode::Esc => self.app.cancel_search(),
-                                    KeyCode::Enter => self.app.finish_search(),
-                                    KeyCode::Backspace => self.app.pop_search_char(),
-                                    KeyCode::Up => self.app.scroll_up(),
-                                    KeyCode::Down => self.app.scroll_down(),
-                                    KeyCode::PageUp => self.app.page_up(),
-                                    KeyCode::PageDown => self.app.page_down(),
-                                    KeyCode::Char(c)
-                                        if !k.modifiers.contains(KeyModifiers::ALT) =>
-                                    {
-                                        self.app.push_search_char(c);
-                                    }
-                                    _ => {}
-                                }
-                            } else if self.app.is_inspecting() {
-                                match k.code {
-                                    KeyCode::Esc
-                                    | KeyCode::Enter
-                                    | KeyCode::Char('i')
-                                    | KeyCode::Char('I') => {
-                                        self.app.close_inspector();
-                                        self.engine.inspect_pids(Vec::new());
-                                    }
-                                    KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
-                                    KeyCode::Char('k') | KeyCode::Char('K') => {
-                                        let pids = self.app.selected_pids();
-                                        self.engine.kill_pids(pids);
-                                    }
-                                    KeyCode::Char('b')
-                                    | KeyCode::Char('B')
-                                    | KeyCode::Char(' ') => {
-                                        self.app.toggle_baseline();
-                                    }
-                                    KeyCode::Up => {
-                                        self.app.scroll_up();
-                                        self.engine.inspect_pids(self.app.selected_pids());
-                                    }
-                                    KeyCode::Down => {
-                                        self.app.scroll_down();
-                                        self.engine.inspect_pids(self.app.selected_pids());
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                match k.code {
-                                    KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
-                                    KeyCode::Esc => self.app.clear_search(),
-                                    KeyCode::Enter | KeyCode::Char('i') | KeyCode::Char('I') => {
-                                        self.app.open_inspector();
-                                        if self.app.is_inspecting() {
-                                            self.engine.inspect_pids(self.app.selected_pids());
-                                        }
-                                    }
-                                    KeyCode::Char('/') => self.app.start_search(),
-                                    KeyCode::Char('g') | KeyCode::Char('G') => {
-                                        self.app.toggle_group();
-                                    }
-                                    KeyCode::Char('b')
-                                    | KeyCode::Char('B')
-                                    | KeyCode::Char(' ') => {
-                                        self.app.toggle_baseline();
-                                    }
-                                    KeyCode::Char('k') | KeyCode::Char('K') => {
-                                        let pids = self.app.selected_pids();
-                                        self.engine.kill_pids(pids);
-                                    }
-                                    KeyCode::Char('n') | KeyCode::Char('N') => {
-                                        self.app.next_sort();
-                                    }
-                                    KeyCode::Char('v') | KeyCode::Char('V') => {
-                                        self.app.toggle_view();
-                                    }
-                                    KeyCode::Up => self.app.scroll_up(),
-                                    KeyCode::Down => self.app.scroll_down(),
-                                    KeyCode::PageUp => self.app.page_up(),
-                                    KeyCode::PageDown => self.app.page_down(),
-                                    _ => {}
-                                }
-                            }
-                            needs_redraw = true;
+                            redraw = true;
                         }
-                        Event::Mouse(m) => match m.kind {
-                            MouseEventKind::ScrollUp => {
-                                self.app.scroll_up();
-                                if self.app.is_inspecting() {
-                                    self.engine.inspect_pids(self.app.selected_pids());
-                                }
-                                needs_redraw = true;
+                        Event::Mouse(m) => {
+                            if self.handle_mouse(m) {
+                                redraw = true;
                             }
-                            MouseEventKind::ScrollDown => {
-                                self.app.scroll_down();
-                                if self.app.is_inspecting() {
-                                    self.engine.inspect_pids(self.app.selected_pids());
-                                }
-                                needs_redraw = true;
-                            }
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                if self.app.handle_left_click(m.column, m.row) {
-                                    if self.app.is_inspecting() {
-                                        self.engine.inspect_pids(self.app.selected_pids());
-                                    } else {
-                                        self.engine.inspect_pids(Vec::new());
-                                    }
-                                    needs_redraw = true;
-                                }
-                            }
-                            MouseEventKind::Down(MouseButton::Right) => {
-                                if self.app.handle_right_click(m.column, m.row) {
-                                    if self.app.is_inspecting() {
-                                        self.engine.inspect_pids(self.app.selected_pids());
-                                    } else {
-                                        self.engine.inspect_pids(Vec::new());
-                                    }
-                                    needs_redraw = true;
-                                }
-                            }
-                            _ => {}
-                        },
-                        Event::Resize(_, _) => {
-                            needs_redraw = true;
                         }
+                        Event::Resize(_, _) => redraw = true,
                         _ => {}
                     }
-
                     if !event::poll(Duration::ZERO)? {
                         break;
                     }
                 }
             }
         }
+    }
+
+    fn handle_key(&mut self, k: KeyEvent) -> bool {
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+        let page = self.app.visible_rows.max(1) as isize;
+        if self.app.searching {
+            match k.code {
+                KeyCode::Esc => {
+                    self.app.searching = false;
+                    self.app.search_query.clear();
+                    self.app.selected_index = 0;
+                    self.app.rebuild_display_rows();
+                }
+                KeyCode::Enter => self.app.searching = false,
+                KeyCode::Backspace => {
+                    self.app.search_query.pop();
+                    self.app.selected_index = 0;
+                    self.app.rebuild_display_rows();
+                }
+                KeyCode::Up => self.app.move_selection(-1),
+                KeyCode::Down => self.app.move_selection(1),
+                KeyCode::PageUp => self.app.move_selection(-page),
+                KeyCode::PageDown => self.app.move_selection(page),
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::ALT) => {
+                    self.app.search_query.push(c);
+                    self.app.selected_index = 0;
+                    self.app.rebuild_display_rows();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        match k.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+            KeyCode::Esc => {
+                if self.app.inspecting {
+                    self.app.close_inspector();
+                    self.engine.inspect_pids(Vec::new());
+                } else if !self.app.search_query.is_empty() {
+                    self.app.search_query.clear();
+                    self.app.selected_index = 0;
+                    self.app.rebuild_display_rows();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('i') | KeyCode::Char('I') => {
+                if self.app.inspecting {
+                    self.app.close_inspector();
+                    self.engine.inspect_pids(Vec::new());
+                } else {
+                    self.app.open_inspector();
+                    self.sync_inspector();
+                }
+            }
+            KeyCode::Char('/') if !self.app.inspecting => {
+                self.app.view_mode = crate::state::ViewMode::Processes;
+                self.app.searching = true;
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') if !self.app.inspecting => {
+                self.app.grouped = !self.app.grouped;
+                self.app.selected_index = 0;
+                self.app.rebuild_display_rows();
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Char(' ') => {
+                self.app.toggle_baseline()
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.engine.kill_pids(self.app.selected_pids())
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if !self.app.inspecting => self.app.next_sort(),
+            KeyCode::Char('v') | KeyCode::Char('V') if !self.app.inspecting => {
+                self.app.toggle_view()
+            }
+            KeyCode::Up => {
+                self.app.move_selection(-1);
+                self.sync_inspector();
+            }
+            KeyCode::Down => {
+                self.app.move_selection(1);
+                self.sync_inspector();
+            }
+            KeyCode::PageUp if !self.app.inspecting => self.app.move_selection(-page),
+            KeyCode::PageDown if !self.app.inspecting => self.app.move_selection(page),
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_mouse(&mut self, m: MouseEvent) -> bool {
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.app.move_selection(-1);
+                self.sync_inspector();
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.app.move_selection(1);
+                self.sync_inspector();
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.app.handle_left_click(m.column, m.row) =>
+            {
+                self.sync_inspector();
+                true
+            }
+            MouseEventKind::Down(MouseButton::Right)
+                if self.app.handle_right_click(m.column, m.row) =>
+            {
+                self.sync_inspector();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn sync_inspector(&self) {
+        let pids = if self.app.inspecting {
+            self.app.selected_pids()
+        } else {
+            Vec::new()
+        };
+        self.engine.inspect_pids(pids);
     }
 }
 

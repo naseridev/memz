@@ -1,29 +1,13 @@
+use crate::analyzer::{
+    AnalyzedState, MAX_HISTORY_SAMPLES, ProcTotals, ProcessStats, RawSystemMemory, build_state,
+    detect_leak, signed_diff,
+};
 use anyhow::Result;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-
-#[derive(Debug, Clone, Default)]
-pub struct MemorySnapshot {
-    pub processes: Vec<ProcessMemory>,
-    pub system: SystemMemory,
-    pub numa_nodes: Vec<NumaNode>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ProcessMemory {
-    pub pid: u32,
-    pub name: String,
-    pub exe: String,
-    pub cmdline: String,
-    pub rss_kb: u64,
-    pub pss_kb: u64,
-    pub shared_clean_kb: u64,
-    pub shared_dirty_kb: u64,
-    pub private_clean_kb: u64,
-    pub private_dirty_kb: u64,
-    pub swap_kb: u64,
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct MemoryBreakdown {
@@ -34,21 +18,6 @@ pub struct MemoryBreakdown {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct SystemMemory {
-    pub total_kb: u64,
-    pub free_kb: u64,
-    pub available_kb: u64,
-    pub buffers_kb: u64,
-    pub cached_kb: u64,
-    pub swap_total_kb: u64,
-    pub swap_free_kb: u64,
-    pub slab_kb: u64,
-    pub page_tables_kb: u64,
-    pub psi_some_avg10: f64,
-    pub psi_full_avg10: f64,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct NumaNode {
     pub node_id: u32,
     pub mem_total_kb: u64,
@@ -56,13 +25,28 @@ pub struct NumaNode {
     pub mem_used_kb: u64,
 }
 
+struct ProcTrack {
+    name: Arc<str>,
+    exe: Arc<str>,
+    cmdline: Arc<str>,
+    history: VecDeque<u64>,
+}
+
 pub struct Collector {
     sys: System,
+    tracks: HashMap<u32, ProcTrack>,
+    system_history: VecDeque<u64>,
+    last_swap_used_kb: Option<u64>,
 }
 
 impl Collector {
     pub fn new() -> Result<Self> {
-        Ok(Self { sys: System::new() })
+        Ok(Self {
+            sys: System::new(),
+            tracks: HashMap::new(),
+            system_history: VecDeque::with_capacity(MAX_HISTORY_SAMPLES),
+            last_swap_used_kb: None,
+        })
     }
 
     pub fn kill_pids(&mut self, pids: &[u32]) {
@@ -73,31 +57,28 @@ impl Collector {
                 true,
                 ProcessRefreshKind::nothing(),
             );
-            if let Some(proc_info) = self.sys.process(sys_pid) {
-                let _ = proc_info.kill();
+            if let Some(p) = self.sys.process(sys_pid) {
+                let _ = p.kill();
             }
         }
     }
 
     pub fn inspect_pids(&self, pids: &[u32]) -> MemoryBreakdown {
         let mut total = MemoryBreakdown::default();
-
         for &pid in pids {
             if let Some(b) = Self::parse_smaps_breakdown(pid) {
                 total.heap_kb = total.heap_kb.saturating_add(b.heap_kb);
                 total.stack_kb = total.stack_kb.saturating_add(b.stack_kb);
                 total.anon_kb = total.anon_kb.saturating_add(b.anon_kb);
                 total.libs_kb = total.libs_kb.saturating_add(b.libs_kb);
-            } else if let Some(proc_info) = self.sys.process(Pid::from_u32(pid)) {
-                let rss_kb = proc_info.memory() / 1024;
-                total.anon_kb = total.anon_kb.saturating_add(rss_kb);
+            } else if let Some(p) = self.sys.process(Pid::from_u32(pid)) {
+                total.anon_kb = total.anon_kb.saturating_add(p.memory() / 1024);
             }
         }
-
         total
     }
 
-    pub fn collect(&mut self) -> Result<MemorySnapshot> {
+    pub fn collect(&mut self) -> Result<AnalyzedState> {
         self.sys
             .refresh_memory_specifics(MemoryRefreshKind::everything());
         self.sys.refresh_processes_specifics(
@@ -108,38 +89,35 @@ impl Collector {
                 .with_exe(UpdateKind::OnlyIfNotSet)
                 .with_cmd(UpdateKind::OnlyIfNotSet),
         );
+        let sys_mem = self.collect_system_memory();
+        let (processes, totals) = self.collect_and_analyze_processes();
+        let numa_nodes = Self::collect_numa_info();
 
-        let system = self.collect_system_memory();
-        let processes = self.collect_processes();
-        let numa_nodes = self.collect_numa_info();
-
-        Ok(MemorySnapshot {
+        Ok(build_state(
             processes,
-            system,
+            totals,
+            sys_mem,
             numa_nodes,
-        })
+            &mut self.system_history,
+            &mut self.last_swap_used_kb,
+        ))
     }
 
-    fn collect_system_memory(&self) -> SystemMemory {
-        let mut mem = SystemMemory {
+    fn collect_system_memory(&self) -> RawSystemMemory {
+        let mut mem = RawSystemMemory {
             total_kb: self.sys.total_memory() / 1024,
             free_kb: self.sys.free_memory() / 1024,
-            available_kb: self.sys.available_memory() / 1024,
+            available_kb: (self.sys.available_memory() / 1024).max(self.sys.free_memory() / 1024),
             swap_total_kb: self.sys.total_swap() / 1024,
             swap_free_kb: self.sys.free_swap() / 1024,
             ..Default::default()
         };
-
-        if mem.available_kb == 0 {
-            mem.available_kb = mem.free_kb;
-        }
-
         if let Ok(content) = fs::read_to_string("/proc/meminfo") {
             for line in content.lines() {
                 let mut parts = line.split_whitespace();
-                if let (Some(key), Some(val_str)) = (parts.next(), parts.next()) {
-                    let val = val_str.parse::<u64>().unwrap_or(0);
-                    match key {
+                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                    let val = v.parse::<u64>().unwrap_or(0);
+                    match k {
                         "Buffers:" => mem.buffers_kb = val,
                         "Cached:" => mem.cached_kb = val,
                         "Slab:" => mem.slab_kb = val,
@@ -149,221 +127,221 @@ impl Collector {
                 }
             }
         } else {
-            let used_kb = self.sys.used_memory() / 1024;
+            let used = self.sys.used_memory() / 1024;
             mem.cached_kb = mem
                 .total_kb
-                .saturating_sub(used_kb)
+                .saturating_sub(used)
                 .saturating_sub(mem.free_kb);
         }
-
-        if let Ok(psi_content) = fs::read_to_string("/proc/pressure/memory") {
-            for line in psi_content.lines() {
+        if let Ok(psi) = fs::read_to_string("/proc/pressure/memory") {
+            for line in psi.lines() {
                 let mut parts = line.split_whitespace();
-                let Some(kind) = parts.next() else {
-                    continue;
-                };
-                for token in parts {
-                    if let Some(val_str) = token.strip_prefix("avg10=")
-                        && let Ok(val) = val_str.parse::<f64>()
+                let Some(kind) = parts.next() else { continue };
+                for tok in parts {
+                    if let Some(v) = tok
+                        .strip_prefix("avg10=")
+                        .and_then(|s| s.parse::<f64>().ok())
                     {
                         match kind {
-                            "some" => mem.psi_some_avg10 = val,
-                            "full" => mem.psi_full_avg10 = val,
+                            "some" => mem.psi_some_avg10 = v,
+                            "full" => mem.psi_full_avg10 = v,
                             _ => {}
                         }
                     }
                 }
             }
         }
-
         mem
     }
 
-    fn collect_processes(&self) -> Vec<ProcessMemory> {
-        self.sys
-            .processes()
-            .iter()
-            .filter_map(|(&pid, proc_info)| {
-                if proc_info.thread_kind().is_some() {
-                    return None;
-                }
+    fn collect_and_analyze_processes(&mut self) -> (Vec<ProcessStats>, ProcTotals) {
+        let mut next_tracks = HashMap::with_capacity(self.sys.processes().len());
+        let mut totals = ProcTotals::default();
+        let mut stats = Vec::with_capacity(self.sys.processes().len());
 
-                let rss_kb = proc_info.memory() / 1024;
-                if rss_kb == 0 {
-                    return None;
-                }
+        for (&pid, p) in self.sys.processes() {
+            if p.thread_kind().is_some() || p.memory() == 0 {
+                continue;
+            }
+            let upid = pid.as_u32();
+            let fallback_rss = p.memory() / 1024;
+            let fallback_swap = (p.virtual_memory() / 1024).saturating_sub(fallback_rss);
+            let (rss_kb, pss_kb, sh_clean, sh_dirty, pr_clean, pr_dirty, swap_kb) =
+                Self::read_smaps(upid).unwrap_or((
+                    fallback_rss,
+                    fallback_rss,
+                    0,
+                    0,
+                    0,
+                    fallback_rss,
+                    fallback_swap,
+                ));
 
-                let upid = pid.as_u32();
-                let vmem_kb = proc_info.virtual_memory() / 1024;
-
-                let name = sanitize_text(&proc_info.name().to_string_lossy());
-                let proc_name = if name.is_empty() {
-                    format!("[{}]", upid)
+            let mut track = self.tracks.remove(&upid).unwrap_or_else(|| {
+                let raw_name = sanitize(&p.name().to_string_lossy());
+                let name = if raw_name.is_empty() {
+                    format!("[{upid}]")
                 } else {
-                    name
+                    raw_name
                 };
-
-                let exe = proc_info
+                let exe = p
                     .exe()
-                    .map(|p| sanitize_text(&p.to_string_lossy()))
+                    .map(|e| sanitize(&e.to_string_lossy()))
                     .unwrap_or_default();
-
-                let cmdline = sanitize_text(
-                    &proc_info
-                        .cmd()
+                let cmd = sanitize(
+                    &p.cmd()
                         .iter()
                         .map(|s| s.to_string_lossy())
                         .collect::<Vec<_>>()
                         .join(" "),
                 );
-
-                if let Some(mut detailed) = Self::read_smaps(upid, proc_name.clone()) {
-                    detailed.exe = exe;
-                    detailed.cmdline = cmdline;
-                    return Some(detailed);
+                ProcTrack {
+                    name: Arc::from(name),
+                    exe: Arc::from(exe),
+                    cmdline: Arc::from(cmd),
+                    history: VecDeque::with_capacity(MAX_HISTORY_SAMPLES),
                 }
+            });
 
-                let swap_kb = vmem_kb.saturating_sub(rss_kb);
+            let last_pss = track.history.back().copied().unwrap_or(pss_kb);
+            let delta = signed_diff(pss_kb, last_pss);
+            if track.history.len() == MAX_HISTORY_SAMPLES {
+                track.history.pop_front();
+            }
+            track.history.push_back(pss_kb);
+            let (is_leaking, leak_rate_kb) = detect_leak(&track.history);
+            let pss_history = track.history.iter().copied().collect();
 
-                Some(ProcessMemory {
-                    pid: upid,
-                    name: proc_name,
-                    exe,
-                    cmdline,
-                    rss_kb,
-                    pss_kb: rss_kb,
-                    shared_clean_kb: 0,
-                    shared_dirty_kb: 0,
-                    private_clean_kb: 0,
-                    private_dirty_kb: rss_kb,
-                    swap_kb,
-                })
-            })
-            .collect()
+            let shared_kb = sh_clean.saturating_add(sh_dirty);
+            let private_kb = pr_clean.saturating_add(pr_dirty);
+            totals.pss_kb = totals.pss_kb.saturating_add(pss_kb);
+            totals.rss_kb = totals.rss_kb.saturating_add(rss_kb);
+            totals.shared_clean_kb = totals.shared_clean_kb.saturating_add(sh_clean);
+            totals.shared_dirty_kb = totals.shared_dirty_kb.saturating_add(sh_dirty);
+            totals.private_kb = totals.private_kb.saturating_add(private_kb);
+
+            stats.push(ProcessStats {
+                pid: upid,
+                name: Arc::clone(&track.name),
+                exe: Arc::clone(&track.exe),
+                cmdline: Arc::clone(&track.cmdline),
+                pss_kb,
+                rss_kb,
+                shared_kb,
+                private_kb,
+                swap_kb,
+                pss_delta_kb: delta,
+                pss_history,
+                is_leaking,
+                leak_rate_kb,
+            });
+            next_tracks.insert(upid, track);
+        }
+        self.tracks = next_tracks;
+        (stats, totals)
     }
 
-    fn read_smaps(pid: u32, name: String) -> Option<ProcessMemory> {
+    fn read_smaps(pid: u32) -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
         let content = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
-
-        let mut mem = ProcessMemory {
-            pid,
-            name,
-            ..Default::default()
-        };
-
+        let (mut rss, mut pss, mut sc, mut sd, mut pc, mut pd, mut sw) = (0, 0, 0, 0, 0, 0, 0);
         for line in content.lines() {
             let mut parts = line.split_whitespace();
-            if let (Some(key), Some(val_str)) = (parts.next(), parts.next()) {
-                let val = val_str.parse::<u64>().unwrap_or(0);
-                match key {
-                    "Rss:" => mem.rss_kb = val,
-                    "Pss:" => mem.pss_kb = val,
-                    "Shared_Clean:" => mem.shared_clean_kb = val,
-                    "Shared_Dirty:" => mem.shared_dirty_kb = val,
-                    "Private_Clean:" => mem.private_clean_kb = val,
-                    "Private_Dirty:" => mem.private_dirty_kb = val,
-                    "Swap:" => mem.swap_kb = val,
+            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                let val = v.parse::<u64>().unwrap_or(0);
+                match k {
+                    "Rss:" => rss = val,
+                    "Pss:" => pss = val,
+                    "Shared_Clean:" => sc = val,
+                    "Shared_Dirty:" => sd = val,
+                    "Private_Clean:" => pc = val,
+                    "Private_Dirty:" => pd = val,
+                    "Swap:" => sw = val,
                     _ => {}
                 }
             }
         }
-
-        if mem.rss_kb == 0 && mem.pss_kb == 0 && mem.swap_kb == 0 {
-            None
-        } else {
-            Some(mem)
-        }
+        (rss > 0 || pss > 0 || sw > 0).then_some((rss, pss, sc, sd, pc, pd, sw))
     }
 
     fn parse_smaps_breakdown(pid: u32) -> Option<MemoryBreakdown> {
         let content = fs::read_to_string(format!("/proc/{pid}/smaps")).ok()?;
-        let mut breakdown = MemoryBreakdown::default();
-
-        let mut current_bucket = 2u8;
-
+        let (mut b, mut bucket) = (MemoryBreakdown::default(), 2u8);
         for line in content.lines() {
             if line.contains('-') && line.split_whitespace().count() >= 5 {
-                let path_part = line.split_whitespace().nth(5).unwrap_or("");
-                current_bucket = if path_part == "[heap]" {
+                let path = line.split_whitespace().nth(5).unwrap_or("");
+                bucket = if path == "[heap]" {
                     0
-                } else if path_part.starts_with("[stack") {
+                } else if path.starts_with("[stack") {
                     1
-                } else if path_part.starts_with('/') {
+                } else if path.starts_with('/') {
                     3
                 } else {
                     2
                 };
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("Pss:")
-                && let Some(val_str) = rest.split_whitespace().next()
-                && let Ok(val) = val_str.parse::<u64>()
+            } else if let Some(val) = line
+                .strip_prefix("Pss:")
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|v| v.parse::<u64>().ok())
             {
-                match current_bucket {
-                    0 => breakdown.heap_kb = breakdown.heap_kb.saturating_add(val),
-                    1 => breakdown.stack_kb = breakdown.stack_kb.saturating_add(val),
-                    3 => breakdown.libs_kb = breakdown.libs_kb.saturating_add(val),
-                    _ => breakdown.anon_kb = breakdown.anon_kb.saturating_add(val),
+                match bucket {
+                    0 => b.heap_kb = b.heap_kb.saturating_add(val),
+                    1 => b.stack_kb = b.stack_kb.saturating_add(val),
+                    3 => b.libs_kb = b.libs_kb.saturating_add(val),
+                    _ => b.anon_kb = b.anon_kb.saturating_add(val),
                 }
             }
         }
-
-        Some(breakdown)
+        Some(b)
     }
 
-    fn collect_numa_info(&self) -> Vec<NumaNode> {
+    fn collect_numa_info() -> Vec<NumaNode> {
         let Ok(entries) = fs::read_dir(Path::new("/sys/devices/system/node")) else {
             return Vec::new();
         };
-
         let mut nodes: Vec<NumaNode> = entries
             .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name();
-                let node_id = name
+            .filter_map(|e| {
+                let id = e
+                    .file_name()
                     .to_string_lossy()
                     .strip_prefix("node")?
                     .parse::<u32>()
                     .ok()?;
-                let content = fs::read_to_string(entry.path().join("meminfo")).ok()?;
-
-                let mut node = NumaNode {
-                    node_id,
-                    ..Default::default()
-                };
-                let mut has_used = false;
-
-                for line in content.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        let val = parts[3].parse::<u64>().unwrap_or(0);
-                        match parts[2] {
-                            "MemTotal:" => node.mem_total_kb = val,
-                            "MemFree:" => node.mem_free_kb = val,
+                let text = fs::read_to_string(e.path().join("meminfo")).ok()?;
+                let (mut n, mut has_used) = (
+                    NumaNode {
+                        node_id: id,
+                        ..Default::default()
+                    },
+                    false,
+                );
+                for l in text.lines() {
+                    let p: Vec<&str> = l.split_whitespace().collect();
+                    if p.len() >= 4 {
+                        let v = p[3].parse::<u64>().unwrap_or(0);
+                        match p[2] {
+                            "MemTotal:" => n.mem_total_kb = v,
+                            "MemFree:" => n.mem_free_kb = v,
                             "MemUsed:" => {
-                                node.mem_used_kb = val;
+                                n.mem_used_kb = v;
                                 has_used = true;
                             }
                             _ => {}
                         }
                     }
                 }
-
                 if !has_used {
-                    node.mem_used_kb = node.mem_total_kb.saturating_sub(node.mem_free_kb);
+                    n.mem_used_kb = n.mem_total_kb.saturating_sub(n.mem_free_kb);
                 }
-
-                Some(node)
+                Some(n)
             })
             .collect();
-
         nodes.sort_by_key(|n| n.node_id);
         nodes
     }
 }
 
-fn sanitize_text(raw: &str) -> String {
+fn sanitize(raw: &str) -> String {
     raw.trim()
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

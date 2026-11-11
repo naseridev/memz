@@ -1,5 +1,5 @@
 use crate::{
-    analyzer::{AnalyzedState, Analyzer},
+    analyzer::AnalyzedState,
     collector::{Collector, MemoryBreakdown},
 };
 use anyhow::Result;
@@ -23,7 +23,6 @@ pub struct Engine {
 impl Engine {
     pub fn new(tick_rate: Duration) -> Result<Self> {
         let mut collector = Collector::new()?;
-        let mut analyzer = Analyzer::new();
 
         let (state_tx, state_rx) = mpsc::sync_channel(1);
         let (inspect_tx, inspect_rx) = mpsc::sync_channel(1);
@@ -35,9 +34,8 @@ impl Engine {
 
             loop {
                 if Instant::now() >= next_tick {
-                    if let Ok(snapshot) = collector.collect() {
-                        analyzer.update(snapshot);
-                        let _ = state_tx.try_send(analyzer.get_state());
+                    if let Ok(state) = collector.collect() {
+                        let _ = state_tx.try_send(state);
                     }
                     if !inspected_pids.is_empty() {
                         let _ = inspect_tx.try_send(collector.inspect_pids(&inspected_pids));

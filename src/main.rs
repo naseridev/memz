@@ -4,6 +4,7 @@ use std::time::Duration;
 mod analyzer;
 mod collector;
 mod engine;
+mod state;
 mod tui;
 mod ui;
 
