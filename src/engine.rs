@@ -37,13 +37,16 @@ impl Engine {
                     if let Ok(state) = collector.collect() {
                         let _ = state_tx.try_send(state);
                     }
+
                     if !inspected_pids.is_empty() {
                         let _ = inspect_tx.try_send(collector.inspect_pids(&inspected_pids));
                     }
+
                     next_tick = Instant::now() + tick_rate;
                 }
 
                 let timeout = next_tick.saturating_duration_since(Instant::now());
+
                 match cmd_rx.recv_timeout(timeout) {
                     Ok(Command::Kill(pids)) => {
                         collector.kill_pids(&pids);
@@ -70,17 +73,21 @@ impl Engine {
 
     pub fn try_recv(&self) -> Option<AnalyzedState> {
         let mut latest = None;
+
         while let Ok(state) = self.state_rx.try_recv() {
             latest = Some(state);
         }
+
         latest
     }
 
     pub fn try_recv_inspect(&self) -> Option<MemoryBreakdown> {
         let mut latest = None;
+
         while let Ok(breakdown) = self.inspect_rx.try_recv() {
             latest = Some(breakdown);
         }
+
         latest
     }
 
@@ -104,6 +111,7 @@ impl Drop for Engine {
         if let Some(tx) = self.cmd_tx.take() {
             let _ = tx.send(Command::Shutdown);
         }
+
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

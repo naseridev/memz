@@ -109,9 +109,11 @@ pub fn build_state(
     last_swap_used_kb: &mut Option<u64>,
 ) -> AnalyzedState {
     let used_kb = sys.total_kb.saturating_sub(sys.available_kb);
+
     if system_history.len() == MAX_HISTORY_SAMPLES {
         system_history.pop_front();
     }
+
     system_history.push_back(used_kb);
 
     let swap_used = sys.swap_total_kb.saturating_sub(sys.swap_free_kb);
@@ -123,6 +125,7 @@ pub fn build_state(
     } else {
         100.0
     };
+
     let thrashing = swap_rate_kb.unsigned_abs() >= 4096;
     let pressure_level = if sys.psi_full_avg10 >= 5.0
         || sys.psi_some_avg10 >= 25.0
@@ -207,9 +210,11 @@ pub fn detect_leak(history: &VecDeque<u64>) -> (bool, u64) {
     let (Some(&first), Some(&last)) = (history.front(), history.back()) else {
         return (false, 0);
     };
+
     if history.len() < MIN_LEAK_SAMPLES || last <= first || last - first < 1024 {
         return (false, 0);
     }
+
     let (mut inc, mut dec, mut peak, mut max_drop) = (0usize, 0usize, first, 0u64);
     for (&prev, &curr) in history.iter().zip(history.iter().skip(1)) {
         if curr > prev {
@@ -217,28 +222,36 @@ pub fn detect_leak(history: &VecDeque<u64>) -> (bool, u64) {
         } else if curr < prev {
             dec += 1;
         }
+
         if curr > peak {
             peak = curr;
         } else {
             max_drop = max_drop.max(peak - curr);
         }
     }
+
     if inc <= dec * 2 || max_drop > (last - first) / 3 {
         return (false, 0);
     }
+
     let n = history.len() as f64;
+
     let (mean_x, mean_y) = ((n - 1.0) / 2.0, history.iter().sum::<u64>() as f64 / n);
     let (mut num, mut den_x, mut den_y) = (0.0, 0.0, 0.0);
+
     for (i, &y) in history.iter().enumerate() {
         let (dx, dy) = (i as f64 - mean_x, y as f64 - mean_y);
         num += dx * dy;
         den_x += dx * dx;
         den_y += dy * dy;
     }
+
     if den_x <= 0.0 || den_y <= 0.0 || num <= 0.0 {
         return (false, 0);
     }
+
     let (slope, r2) = (num / den_x, (num * num) / (den_x * den_y));
+
     if slope >= 32.0 && r2 >= 0.70 {
         (true, slope.round() as u64)
     } else {

@@ -460,6 +460,7 @@ fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
     for (label, kb, color) in categories {
         let pct = percentage(kb, total_kb);
         let bar = ascii_bar(pct, 45);
+
         lines.push(Line::from(vec![
             Span::styled(format!("{label:16} "), Style::default().fg(color)),
             Span::raw(format!("{:7.1} GiB ({:5.1}%) ", to_gib(kb), pct)),

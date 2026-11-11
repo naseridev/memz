@@ -22,11 +22,14 @@ pub struct Tui {
 impl Tui {
     pub fn new(engine: Engine) -> Result<Self> {
         let mut app = App::new();
+
         if let Some(initial) = engine.try_recv() {
             app.update_data(initial);
         }
+
         let terminal = ratatui::init();
         let _ = execute!(io::stdout(), EnableMouseCapture);
+
         Ok(Self {
             terminal,
             engine,
@@ -80,9 +83,11 @@ impl Tui {
 
         if let Some(state) = self.engine.try_recv() {
             self.app.update_data(state);
+
             if self.app.inspecting {
                 self.engine.inspect_pids(self.app.selected_pids());
             }
+
             updated = true;
         }
 
@@ -261,6 +266,7 @@ impl Tui {
         } else {
             Vec::new()
         };
+
         self.engine.inspect_pids(pids);
     }
 }

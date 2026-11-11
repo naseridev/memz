@@ -375,6 +375,7 @@ impl App {
 
         let relative_row = (row - first_data_row) as usize;
         let index = self.table_state.offset().saturating_add(relative_row);
+
         (index < self.display_rows.len()).then_some(index)
     }
 
@@ -413,6 +414,7 @@ impl App {
                 } else {
                     proc_stat.pss_delta_kb
                 };
+
                 DisplayRow::from_process(proc_stat, delta_kb)
             })
             .collect()
@@ -437,6 +439,7 @@ impl App {
             if !group.is_leaking {
                 let history_queue: VecDeque<u64> = group.pss_history.iter().copied().collect();
                 let (is_leaking, leak_rate_kb) = detect_leak(&history_queue);
+
                 group.is_leaking = is_leaking;
                 group.leak_rate_kb = leak_rate_kb;
             }
@@ -521,11 +524,13 @@ fn merge_history(target: &mut Vec<u64>, source: &[u64]) {
     if source.is_empty() {
         return;
     }
+
     if target.len() < source.len() {
         let mut padded = vec![0u64; source.len() - target.len()];
         padded.append(target);
         *target = padded;
     }
+
     let offset = target.len() - source.len();
     for (target_val, &source_val) in target.iter_mut().skip(offset).zip(source) {
         *target_val = target_val.saturating_add(source_val);

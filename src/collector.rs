@@ -77,6 +77,7 @@ impl Collector {
                 true,
                 ProcessRefreshKind::nothing(),
             );
+
             if let Some(process) = self.sys.process(sys_pid) {
                 let _ = process.kill();
             }
@@ -145,6 +146,7 @@ impl Collector {
                 let (Some(key), Some(val_str)) = (parts.next(), parts.next()) else {
                     continue;
                 };
+
                 let value = val_str.parse::<u64>().unwrap_or(0);
                 match key {
                     "Buffers:" => memory.buffers_kb = value,
@@ -175,13 +177,16 @@ impl Collector {
             let Some(kind) = parts.next() else {
                 continue;
             };
+
             for token in parts {
                 let Some(avg_str) = token.strip_prefix("avg10=") else {
                     continue;
                 };
+
                 let Ok(value) = avg_str.parse::<f64>() else {
                     continue;
                 };
+
                 match kind {
                     "some" => memory.psi_some_avg10 = value,
                     "full" => memory.psi_full_avg10 = value,
@@ -233,6 +238,7 @@ impl Collector {
             totals.shared_clean_kb = totals
                 .shared_clean_kb
                 .saturating_add(metrics.shared_clean_kb);
+
             totals.shared_dirty_kb = totals
                 .shared_dirty_kb
                 .saturating_add(metrics.shared_dirty_kb);
@@ -313,6 +319,7 @@ impl Collector {
             let (Some(key), Some(val_str)) = (parts.next(), parts.next()) else {
                 continue;
             };
+
             let value = val_str.parse::<u64>().unwrap_or(0);
             match key {
                 "Rss:" => rollup.rss_kb = value,
@@ -336,12 +343,14 @@ impl Collector {
     fn parse_smaps_breakdown(pid: u32) -> Option<MemoryBreakdown> {
         let path = format!("/proc/{pid}/smaps");
         let content = fs::read_to_string(path).ok()?;
+
         let mut breakdown = MemoryBreakdown::default();
         let mut category = RegionCategory::Anonymous;
 
         for line in content.lines() {
             if line.contains('-') && line.split_whitespace().count() >= 5 {
                 let mapping_name = line.split_whitespace().nth(5).unwrap_or("");
+
                 category = if mapping_name == "[heap]" {
                     RegionCategory::Heap
                 } else if mapping_name.starts_with("[stack") {
@@ -351,15 +360,18 @@ impl Collector {
                 } else {
                     RegionCategory::Anonymous
                 };
+
                 continue;
             }
 
             let Some(rest) = line.strip_prefix("Pss:") else {
                 continue;
             };
+
             let Some(val_str) = rest.split_whitespace().next() else {
                 continue;
             };
+
             let Ok(pss_kb) = val_str.parse::<u64>() else {
                 continue;
             };
@@ -409,13 +421,16 @@ impl Collector {
             node_id,
             ..Default::default()
         };
+
         let mut has_explicit_used = false;
 
         for line in meminfo.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
+
             if parts.len() < 4 {
                 continue;
             }
+
             let value = parts[3].parse::<u64>().unwrap_or(0);
             match parts[2] {
                 "MemTotal:" => node.mem_total_kb = value,
