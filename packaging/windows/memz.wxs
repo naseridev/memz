@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="memz"
+    Manufacturer="$(var.Manufacturer)"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="{6F2B0C1E-8A4D-4E7B-9C3A-5D1F2E8B7A90}"
+    Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of memz is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="memz">
+        <Component Id="MemzExecutable" Guid="{3A9E4C71-2D5B-4F8A-B6E0-7C1D9F3A2B54}">
+          <File Id="MemzExe" Source="$(var.BinaryPath)" KeyPath="yes" />
+          <Environment Id="MemzPath" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" />
+        </Component>
+        <Component Id="MemzReadme" Guid="{B41D7E2A-9C6F-4A3E-8D05-1F7B2C9E6A38}">
+          <File Id="MemzReadmeFile" Source="$(var.ReadmePath)" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="memz" Level="1">
+      <ComponentRef Id="MemzExecutable" />
+      <ComponentRef Id="MemzReadme" />
+    </Feature>
+  </Package>
+</Wix>

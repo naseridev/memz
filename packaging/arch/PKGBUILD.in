@@ -1,0 +1,17 @@
+pkgname=memz
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='@DESCRIPTION@'
+arch=('x86_64')
+url='@URL@'
+license=('@LICENSE@')
+depends=('gcc-libs')
+source=("${pkgname}-v@VERSION@-@TARGET@.tar.gz")
+sha256sums=('@SHA256@')
+
+package() {
+  local dir="${srcdir}/${pkgname}-v@VERSION@-@TARGET@"
+  install -Dm755 "${dir}/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+  install -Dm644 "${dir}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "${dir}/README.wiki.md" "${pkgdir}/usr/share/doc/${pkgname}/README.wiki.md"
+}
