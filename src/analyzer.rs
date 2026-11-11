@@ -26,7 +26,6 @@ pub struct AnalyzedState {
 pub struct ProcessStats {
     pub pid: u32,
     pub name: Arc<str>,
-    pub exe: Arc<str>,
     pub cmdline: Arc<str>,
     pub pss_kb: u64,
     pub rss_kb: u64,

@@ -6,6 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     widgets::TableState,
 };
+use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -18,6 +19,17 @@ pub const TABLE_CONSTRAINTS: [Constraint; 8] = [
     Constraint::Length(10),
     Constraint::Length(8),
     Constraint::Length(9),
+];
+
+const SORT_COLUMNS: [SortMode; 8] = [
+    SortMode::Pid,
+    SortMode::Name,
+    SortMode::Pss,
+    SortMode::Rss,
+    SortMode::Shared,
+    SortMode::Private,
+    SortMode::Swap,
+    SortMode::Delta,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,6 +45,40 @@ pub enum SortMode {
     Delta,
 }
 
+impl SortMode {
+    pub fn label(self, grouped: bool) -> &'static str {
+        match self {
+            Self::Pid => {
+                if grouped {
+                    "Count"
+                } else {
+                    "PID"
+                }
+            }
+            Self::Name => "Name",
+            Self::Pss => "PSS",
+            Self::Rss => "RSS",
+            Self::Shared => "Shared",
+            Self::Private => "Private",
+            Self::Swap => "Swap",
+            Self::Delta => "Delta",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Pss => Self::Rss,
+            Self::Rss => Self::Shared,
+            Self::Shared => Self::Private,
+            Self::Private => Self::Swap,
+            Self::Swap => Self::Delta,
+            Self::Delta => Self::Pid,
+            Self::Pid => Self::Name,
+            Self::Name => Self::Pss,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
@@ -41,12 +87,29 @@ pub enum ViewMode {
     SharedMemory,
 }
 
+impl ViewMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Processes => Self::MemoryMap,
+            Self::MemoryMap => Self::SharedMemory,
+            Self::SharedMemory => Self::Processes,
+        }
+    }
+
+    pub fn next_label(self) -> &'static str {
+        match self {
+            Self::Processes => "map",
+            Self::MemoryMap => "shared",
+            Self::SharedMemory => "process",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DisplayRow {
     pub pid: u32,
     pub count: usize,
     pub name: Arc<str>,
-    pub exe: Arc<str>,
     pub cmdline: Arc<str>,
     pub pss_kb: u64,
     pub rss_kb: u64,
@@ -58,6 +121,61 @@ pub struct DisplayRow {
     pub is_leaking: bool,
     pub leak_rate_kb: u64,
     pub pids: Vec<u32>,
+}
+
+impl DisplayRow {
+    fn from_process(proc_stat: &ProcessStats, delta_kb: i64) -> Self {
+        Self {
+            pid: proc_stat.pid,
+            count: 1,
+            name: Arc::clone(&proc_stat.name),
+            cmdline: Arc::clone(&proc_stat.cmdline),
+            pss_kb: proc_stat.pss_kb,
+            rss_kb: proc_stat.rss_kb,
+            shared_kb: proc_stat.shared_kb,
+            private_kb: proc_stat.private_kb,
+            swap_kb: proc_stat.swap_kb,
+            pss_delta_kb: delta_kb,
+            pss_history: proc_stat.pss_history.clone(),
+            is_leaking: proc_stat.is_leaking,
+            leak_rate_kb: proc_stat.leak_rate_kb,
+            pids: vec![proc_stat.pid],
+        }
+    }
+
+    fn empty_group_from(proc_stat: &ProcessStats) -> Self {
+        Self {
+            pid: proc_stat.pid,
+            count: 0,
+            name: Arc::clone(&proc_stat.name),
+            cmdline: Arc::clone(&proc_stat.cmdline),
+            pss_kb: 0,
+            rss_kb: 0,
+            shared_kb: 0,
+            private_kb: 0,
+            swap_kb: 0,
+            pss_delta_kb: 0,
+            pss_history: Vec::new(),
+            is_leaking: false,
+            leak_rate_kb: 0,
+            pids: Vec::new(),
+        }
+    }
+
+    fn merge_process(&mut self, proc_stat: &ProcessStats) {
+        self.pid = self.pid.min(proc_stat.pid);
+        self.count += 1;
+        self.pss_kb = self.pss_kb.saturating_add(proc_stat.pss_kb);
+        self.rss_kb = self.rss_kb.saturating_add(proc_stat.rss_kb);
+        self.shared_kb = self.shared_kb.saturating_add(proc_stat.shared_kb);
+        self.private_kb = self.private_kb.saturating_add(proc_stat.private_kb);
+        self.swap_kb = self.swap_kb.saturating_add(proc_stat.swap_kb);
+        self.pss_delta_kb = self.pss_delta_kb.saturating_add(proc_stat.pss_delta_kb);
+        self.is_leaking |= proc_stat.is_leaking;
+        self.leak_rate_kb = self.leak_rate_kb.saturating_add(proc_stat.leak_rate_kb);
+        self.pids.push(proc_stat.pid);
+        merge_history(&mut self.pss_history, &proc_stat.pss_history);
+    }
 }
 
 #[derive(Default)]
@@ -89,14 +207,17 @@ impl App {
         }
     }
 
+    pub fn is_process_view(&self) -> bool {
+        self.view_mode == ViewMode::Processes
+    }
+
     pub fn update_data(&mut self, state: AnalyzedState) {
         self.state = state;
         self.rebuild_display_rows();
     }
 
     pub fn open_inspector(&mut self) {
-        if !self.display_rows.is_empty() {
-            self.view_mode = ViewMode::Processes;
+        if self.is_process_view() && !self.display_rows.is_empty() {
             self.inspecting = true;
             self.inspector_breakdown = None;
         }
@@ -110,271 +231,218 @@ impl App {
     pub fn toggle_baseline(&mut self) {
         self.baseline_pids.clear();
         self.baseline_groups.clear();
+
         if self.baseline_system_pss_kb.take().is_none() {
-            for p in &self.state.processes {
-                self.baseline_pids.insert(p.pid, p.pss_kb);
-                let e = self.baseline_groups.entry(Arc::clone(&p.name)).or_insert(0);
-                *e = e.saturating_add(p.pss_kb);
+            for proc_stat in &self.state.processes {
+                self.baseline_pids.insert(proc_stat.pid, proc_stat.pss_kb);
+                let group_total = self
+                    .baseline_groups
+                    .entry(Arc::clone(&proc_stat.name))
+                    .or_insert(0);
+                *group_total = group_total.saturating_add(proc_stat.pss_kb);
             }
             self.baseline_system_pss_kb = Some(self.state.system.total_process_pss_kb);
         }
+
         self.rebuild_display_rows();
     }
 
     pub fn selected_pids(&self) -> Vec<u32> {
+        if !self.is_process_view() {
+            return Vec::new();
+        }
         self.display_rows
             .get(self.selected_index)
-            .map(|r| r.pids.clone())
+            .map(|row| row.pids.clone())
             .unwrap_or_default()
     }
 
     pub fn next_sort(&mut self) {
-        self.sort_mode = match self.sort_mode {
-            SortMode::Pss => SortMode::Rss,
-            SortMode::Rss => SortMode::Shared,
-            SortMode::Shared => SortMode::Private,
-            SortMode::Private => SortMode::Swap,
-            SortMode::Swap => SortMode::Delta,
-            SortMode::Delta => SortMode::Pid,
-            SortMode::Pid => SortMode::Name,
-            SortMode::Name => SortMode::Pss,
-        };
+        if !self.is_process_view() {
+            return;
+        }
+        self.sort_mode = self.sort_mode.next();
         self.selected_index = 0;
         self.rebuild_display_rows();
     }
 
     pub fn toggle_view(&mut self) {
-        self.view_mode = match self.view_mode {
-            ViewMode::Processes => ViewMode::MemoryMap,
-            ViewMode::MemoryMap => ViewMode::SharedMemory,
-            ViewMode::SharedMemory => ViewMode::Processes,
-        };
+        self.close_inspector();
+        self.searching = false;
+        self.view_mode = self.view_mode.next();
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.display_rows.is_empty() {
+        if !self.is_process_view() || self.display_rows.is_empty() {
             return;
         }
-        let max_idx = self.display_rows.len().saturating_sub(1);
-        let next = self
+        let max_index = self.display_rows.len().saturating_sub(1);
+        let next_index = self
             .selected_index
             .saturating_add_signed(delta)
-            .min(max_idx);
-        if next != self.selected_index {
-            self.selected_index = next;
+            .min(max_index);
+
+        if next_index != self.selected_index {
+            self.selected_index = next_index;
             self.inspector_breakdown = None;
             self.sync_table_state();
         }
     }
 
-    pub fn handle_left_click(&mut self, col: u16, row: u16) -> bool {
+    pub fn handle_left_click(&mut self, column: u16, row: u16) -> bool {
         if self.inspecting {
-            if !contains(self.modal_area, col, row) {
+            if !rect_contains(self.modal_area, column, row) {
                 self.close_inspector();
                 return true;
             }
             return false;
         }
-        if self.view_mode != ViewMode::Processes || !contains(self.table_area, col, row) {
+
+        if !self.is_process_view() || !rect_contains(self.table_area, column, row) {
             return false;
         }
-        let header_y = self.table_area.y.saturating_add(1);
-        if row == header_y {
-            let inner = Rect::new(
-                self.table_area.x.saturating_add(1),
-                header_y,
-                self.table_area.width.saturating_sub(2),
-                1,
-            );
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(TABLE_CONSTRAINTS)
-                .spacing(1)
-                .split(inner);
-            let modes = [
-                SortMode::Pid,
-                SortMode::Name,
-                SortMode::Pss,
-                SortMode::Rss,
-                SortMode::Shared,
-                SortMode::Private,
-                SortMode::Swap,
-                SortMode::Delta,
-            ];
-            for (r, mode) in cols.iter().zip(modes) {
-                if col >= r.x && col < r.right() {
-                    self.sort_mode = mode;
-                    self.selected_index = 0;
-                    self.rebuild_display_rows();
-                    return true;
-                }
-            }
+
+        let header_row = self.table_area.y.saturating_add(1);
+        if row == header_row {
+            return self.handle_header_click(column, header_row);
+        }
+
+        let Some(clicked_index) = self.row_index_at(row) else {
             return false;
+        };
+
+        if self.selected_index == clicked_index {
+            self.open_inspector();
+        } else {
+            self.selected_index = clicked_index;
+            self.inspector_breakdown = None;
+            self.sync_table_state();
         }
-        if let Some(idx) = self.row_at(row) {
-            if self.selected_index == idx {
-                self.open_inspector();
-            } else {
-                self.selected_index = idx;
-                self.inspector_breakdown = None;
-                self.sync_table_state();
-            }
-            return true;
-        }
-        false
+        true
     }
 
-    pub fn handle_right_click(&mut self, col: u16, row: u16) -> bool {
+    pub fn handle_right_click(&mut self, column: u16, row: u16) -> bool {
         if self.inspecting {
             self.close_inspector();
             return true;
         }
-        if self.view_mode == ViewMode::Processes
-            && contains(self.table_area, col, row)
-            && let Some(idx) = self.row_at(row)
-        {
-            self.selected_index = idx;
-            self.sync_table_state();
-            self.open_inspector();
-            return true;
+
+        if !self.is_process_view() || !rect_contains(self.table_area, column, row) {
+            return false;
+        }
+
+        let Some(clicked_index) = self.row_index_at(row) else {
+            return false;
+        };
+
+        self.selected_index = clicked_index;
+        self.sync_table_state();
+        self.open_inspector();
+        true
+    }
+
+    fn handle_header_click(&mut self, column: u16, header_row: u16) -> bool {
+        let inner_header = Rect::new(
+            self.table_area.x.saturating_add(1),
+            header_row,
+            self.table_area.width.saturating_sub(2),
+            1,
+        );
+        let column_rects = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(TABLE_CONSTRAINTS)
+            .spacing(1)
+            .split(inner_header);
+
+        for (col_rect, mode) in column_rects.iter().zip(SORT_COLUMNS) {
+            if column >= col_rect.x && column < col_rect.right() {
+                self.sort_mode = mode;
+                self.selected_index = 0;
+                self.rebuild_display_rows();
+                return true;
+            }
         }
         false
     }
 
-    fn row_at(&self, row: u16) -> Option<usize> {
-        let (start, end) = (
-            self.table_area.y.saturating_add(3),
-            self.table_area.bottom().saturating_sub(1),
-        );
-        if row >= start && row < end {
-            let idx = self
-                .table_state
-                .offset()
-                .saturating_add((row - start) as usize);
-            (idx < self.display_rows.len()).then_some(idx)
-        } else {
-            None
+    fn row_index_at(&self, row: u16) -> Option<usize> {
+        let first_data_row = self.table_area.y.saturating_add(3);
+        let last_data_row = self.table_area.bottom().saturating_sub(1);
+
+        if row < first_data_row || row >= last_data_row {
+            return None;
         }
+
+        let relative_row = (row - first_data_row) as usize;
+        let index = self.table_state.offset().saturating_add(relative_row);
+        (index < self.display_rows.len()).then_some(index)
     }
 
     pub fn rebuild_display_rows(&mut self) {
-        let q = self.search_query.trim().to_lowercase();
-        let has_base = self.baseline_system_pss_kb.is_some();
+        let query = self.search_query.trim().to_lowercase();
         let filtered: Vec<&ProcessStats> = self
             .state
             .processes
             .iter()
-            .filter(|p| {
-                q.is_empty() || p.name.to_lowercase().contains(&q) || p.pid.to_string().contains(&q)
-            })
+            .filter(|proc_stat| matches_query(proc_stat, &query))
             .collect();
 
-        let mut rows: Vec<DisplayRow> = if self.grouped {
-            let mut groups: HashMap<Arc<str>, DisplayRow> = HashMap::new();
-            for p in filtered {
-                let e = groups
-                    .entry(Arc::clone(&p.name))
-                    .or_insert_with(|| DisplayRow {
-                        pid: p.pid,
-                        count: 0,
-                        name: Arc::clone(&p.name),
-                        exe: Arc::clone(&p.exe),
-                        cmdline: Arc::clone(&p.cmdline),
-                        pss_kb: 0,
-                        rss_kb: 0,
-                        shared_kb: 0,
-                        private_kb: 0,
-                        swap_kb: 0,
-                        pss_delta_kb: 0,
-                        pss_history: Vec::new(),
-                        is_leaking: false,
-                        leak_rate_kb: 0,
-                        pids: Vec::new(),
-                    });
-                e.pid = e.pid.min(p.pid);
-                e.count += 1;
-                e.pss_kb = e.pss_kb.saturating_add(p.pss_kb);
-                e.rss_kb = e.rss_kb.saturating_add(p.rss_kb);
-                e.shared_kb = e.shared_kb.saturating_add(p.shared_kb);
-                e.private_kb = e.private_kb.saturating_add(p.private_kb);
-                e.swap_kb = e.swap_kb.saturating_add(p.swap_kb);
-                e.pss_delta_kb = e.pss_delta_kb.saturating_add(p.pss_delta_kb);
-                e.is_leaking |= p.is_leaking;
-                e.leak_rate_kb = e.leak_rate_kb.saturating_add(p.leak_rate_kb);
-                e.pids.push(p.pid);
-                merge_history(&mut e.pss_history, &p.pss_history);
-            }
-            for r in groups.values_mut() {
-                if has_base {
-                    r.pss_delta_kb = signed_diff(
-                        r.pss_kb,
-                        self.baseline_groups.get(&r.name).copied().unwrap_or(0),
-                    );
-                }
-                if !r.is_leaking {
-                    let dq: VecDeque<u64> = r.pss_history.iter().copied().collect();
-                    (r.is_leaking, r.leak_rate_kb) = detect_leak(&dq);
-                }
-            }
-            groups.into_values().collect()
+        let mut rows = if self.grouped {
+            self.build_grouped_rows(&filtered)
         } else {
-            filtered
-                .into_iter()
-                .map(|p| DisplayRow {
-                    pid: p.pid,
-                    count: 1,
-                    name: Arc::clone(&p.name),
-                    exe: Arc::clone(&p.exe),
-                    cmdline: Arc::clone(&p.cmdline),
-                    pss_kb: p.pss_kb,
-                    rss_kb: p.rss_kb,
-                    shared_kb: p.shared_kb,
-                    private_kb: p.private_kb,
-                    swap_kb: p.swap_kb,
-                    pss_delta_kb: if has_base {
-                        signed_diff(
-                            p.pss_kb,
-                            self.baseline_pids.get(&p.pid).copied().unwrap_or(0),
-                        )
-                    } else {
-                        p.pss_delta_kb
-                    },
-                    pss_history: p.pss_history.clone(),
-                    is_leaking: p.is_leaking,
-                    leak_rate_kb: p.leak_rate_kb,
-                    pids: vec![p.pid],
-                })
-                .collect()
+            self.build_individual_rows(&filtered)
         };
 
-        rows.sort_unstable_by(|a, b| match self.sort_mode {
-            SortMode::Pss => b.pss_kb.cmp(&a.pss_kb).then_with(|| a.pid.cmp(&b.pid)),
-            SortMode::Rss => b.rss_kb.cmp(&a.rss_kb).then_with(|| a.pid.cmp(&b.pid)),
-            SortMode::Shared => b
-                .shared_kb
-                .cmp(&a.shared_kb)
-                .then_with(|| a.pid.cmp(&b.pid)),
-            SortMode::Private => b
-                .private_kb
-                .cmp(&a.private_kb)
-                .then_with(|| a.pid.cmp(&b.pid)),
-            SortMode::Swap => b.swap_kb.cmp(&a.swap_kb).then_with(|| a.pid.cmp(&b.pid)),
-            SortMode::Delta => b
-                .pss_delta_kb
-                .saturating_abs()
-                .cmp(&a.pss_delta_kb.saturating_abs())
-                .then_with(|| b.pss_kb.cmp(&a.pss_kb)),
-            SortMode::Name => a.name.cmp(&b.name).then_with(|| b.pss_kb.cmp(&a.pss_kb)),
-            SortMode::Pid => {
-                if self.grouped {
-                    b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name))
-                } else {
-                    a.pid.cmp(&b.pid)
-                }
-            }
-        });
+        let sort_mode = self.sort_mode;
+        let grouped = self.grouped;
+        rows.sort_unstable_by(|left, right| compare_rows(left, right, sort_mode, grouped));
+
         self.display_rows = rows;
         self.sync_table_state();
+    }
+
+    fn build_individual_rows(&self, processes: &[&ProcessStats]) -> Vec<DisplayRow> {
+        let has_baseline = self.baseline_system_pss_kb.is_some();
+
+        processes
+            .iter()
+            .map(|proc_stat| {
+                let delta_kb = if has_baseline {
+                    let base = self.baseline_pids.get(&proc_stat.pid).copied().unwrap_or(0);
+                    signed_diff(proc_stat.pss_kb, base)
+                } else {
+                    proc_stat.pss_delta_kb
+                };
+                DisplayRow::from_process(proc_stat, delta_kb)
+            })
+            .collect()
+    }
+
+    fn build_grouped_rows(&self, processes: &[&ProcessStats]) -> Vec<DisplayRow> {
+        let has_baseline = self.baseline_system_pss_kb.is_some();
+        let mut groups: HashMap<Arc<str>, DisplayRow> = HashMap::new();
+
+        for proc_stat in processes {
+            let entry = groups
+                .entry(Arc::clone(&proc_stat.name))
+                .or_insert_with(|| DisplayRow::empty_group_from(proc_stat));
+            entry.merge_process(proc_stat);
+        }
+
+        for group in groups.values_mut() {
+            if has_baseline {
+                let base = self.baseline_groups.get(&group.name).copied().unwrap_or(0);
+                group.pss_delta_kb = signed_diff(group.pss_kb, base);
+            }
+            if !group.is_leaking {
+                let history_queue: VecDeque<u64> = group.pss_history.iter().copied().collect();
+                let (is_leaking, leak_rate_kb) = detect_leak(&history_queue);
+                group.is_leaking = is_leaking;
+                group.leak_rate_kb = leak_rate_kb;
+            }
+        }
+
+        groups.into_values().collect()
     }
 
     pub fn sync_table_state(&mut self) {
@@ -389,8 +457,64 @@ impl App {
     }
 }
 
-fn contains(r: Rect, col: u16, row: u16) -> bool {
-    col >= r.x && col < r.right() && row >= r.y && row < r.bottom()
+fn matches_query(proc_stat: &ProcessStats, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    proc_stat.name.to_lowercase().contains(query) || proc_stat.pid.to_string().contains(query)
+}
+
+fn compare_rows(
+    left: &DisplayRow,
+    right: &DisplayRow,
+    sort_mode: SortMode,
+    grouped: bool,
+) -> Ordering {
+    match sort_mode {
+        SortMode::Pss => right
+            .pss_kb
+            .cmp(&left.pss_kb)
+            .then_with(|| left.pid.cmp(&right.pid)),
+        SortMode::Rss => right
+            .rss_kb
+            .cmp(&left.rss_kb)
+            .then_with(|| left.pid.cmp(&right.pid)),
+        SortMode::Shared => right
+            .shared_kb
+            .cmp(&left.shared_kb)
+            .then_with(|| left.pid.cmp(&right.pid)),
+        SortMode::Private => right
+            .private_kb
+            .cmp(&left.private_kb)
+            .then_with(|| left.pid.cmp(&right.pid)),
+        SortMode::Swap => right
+            .swap_kb
+            .cmp(&left.swap_kb)
+            .then_with(|| left.pid.cmp(&right.pid)),
+        SortMode::Delta => right
+            .pss_delta_kb
+            .saturating_abs()
+            .cmp(&left.pss_delta_kb.saturating_abs())
+            .then_with(|| right.pss_kb.cmp(&left.pss_kb)),
+        SortMode::Name => left
+            .name
+            .cmp(&right.name)
+            .then_with(|| right.pss_kb.cmp(&left.pss_kb)),
+        SortMode::Pid => {
+            if grouped {
+                right
+                    .count
+                    .cmp(&left.count)
+                    .then_with(|| left.name.cmp(&right.name))
+            } else {
+                left.pid.cmp(&right.pid)
+            }
+        }
+    }
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
 fn merge_history(target: &mut Vec<u64>, source: &[u64]) {
@@ -403,7 +527,7 @@ fn merge_history(target: &mut Vec<u64>, source: &[u64]) {
         *target = padded;
     }
     let offset = target.len() - source.len();
-    for (t, &s) in target.iter_mut().skip(offset).zip(source) {
-        *t = t.saturating_add(s);
+    for (target_val, &source_val) in target.iter_mut().skip(offset).zip(source) {
+        *target_val = target_val.saturating_add(source_val);
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     analyzer::{PressureLevel, signed_diff},
     collector::MemoryBreakdown,
-    state::{App, SortMode, TABLE_CONSTRAINTS, ViewMode},
+    state::{App, DisplayRow, TABLE_CONSTRAINTS, ViewMode},
 };
 use ratatui::{
     Frame,
@@ -15,14 +15,17 @@ const COLOR_PRIMARY: Color = Color::White;
 const COLOR_SECONDARY: Color = Color::Rgb(255, 115, 40);
 const COLOR_ALERT: Color = Color::LightRed;
 const COLOR_HEALTHY: Color = Color::LightGreen;
+const SIGNIFICANT_DELTA_KB: i64 = 10_240;
 
 fn to_gib(kb: u64) -> f64 {
     kb as f64 / 1024.0 / 1024.0
 }
+
 fn to_mib(kb: u64) -> f64 {
     kb as f64 / 1024.0
 }
-fn pct(part: u64, total: u64) -> f64 {
+
+fn percentage(part: u64, total: u64) -> f64 {
     if total > 0 {
         (part as f64 / total as f64) * 100.0
     } else {
@@ -30,45 +33,54 @@ fn pct(part: u64, total: u64) -> f64 {
     }
 }
 
-pub fn draw(f: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
+fn ascii_bar(percent: f64, max_width: usize) -> String {
+    let ratio = percent.clamp(0.0, 100.0) / 100.0;
+    let filled = (ratio * max_width as f64) as usize;
+    "#".repeat(filled)
+}
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(8),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
-        .split(f.area());
+        .split(frame.area());
 
-    app.table_area = chunks[1];
-    app.visible_rows = chunks[1].height.saturating_sub(4) as usize;
+    app.table_area = layout[1];
+    app.visible_rows = layout[1].height.saturating_sub(4) as usize;
     app.sync_table_state();
 
-    draw_system_stats(f, chunks[0], app);
-    match app.view_mode {
-        ViewMode::Processes => draw_process_list(f, chunks[1], app),
-        ViewMode::MemoryMap => draw_memory_map(f, chunks[1], app),
-        ViewMode::SharedMemory => draw_shared_view(f, chunks[1], app),
-    }
-    draw_help(f, chunks[2], app);
+    draw_system_stats(frame, layout[0], app);
 
-    if app.inspecting {
-        app.modal_area = centered_rect(58, 52, f.area());
-        draw_inspector_modal(f, app.modal_area, app);
+    match app.view_mode {
+        ViewMode::Processes => draw_process_list(frame, layout[1], app),
+        ViewMode::MemoryMap => draw_memory_map(frame, layout[1], app),
+        ViewMode::SharedMemory => draw_shared_view(frame, layout[1], app),
+    }
+
+    draw_footer(frame, layout[2], app);
+
+    if app.inspecting && app.is_process_view() {
+        app.modal_area = centered_rect(58, 52, frame.area());
+        draw_inspector_modal(frame, app.modal_area, app);
     }
 }
 
-fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
+fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
     let sys = &app.state.system;
-    let label = Style::default().fg(COLOR_SECONDARY);
-    let cols = Layout::default()
+    let label_style = Style::default().fg(COLOR_SECONDARY);
+
+    let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
 
-    let (p_txt, p_style) = match sys.pressure_level {
+    let (pressure_text, pressure_style) = match sys.pressure_level {
         PressureLevel::Healthy => ("HEALTHY", Style::default().fg(COLOR_HEALTHY)),
-        PressureLevel::Warning => ("WARNING", label.add_modifier(Modifier::BOLD)),
+        PressureLevel::Warning => ("WARNING", label_style.add_modifier(Modifier::BOLD)),
         PressureLevel::Critical => (
             "CRITICAL / SWAPPING",
             Style::default()
@@ -76,12 +88,14 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
     };
-    let swap_io = if sys.swap_rate_kb != 0 {
+
+    let swap_rate_suffix = if sys.swap_rate_kb != 0 {
         format!(" ({:+.1} MiB/s)", sys.swap_rate_kb as f64 / 1024.0)
     } else {
         String::new()
     };
-    let psi = if sys.psi_some_avg10 > 0.0 || sys.psi_full_avg10 > 0.0 {
+
+    let psi_suffix = if sys.psi_some_avg10 > 0.0 || sys.psi_full_avg10 > 0.0 {
         format!(
             " | PSI {:.1}%/{:.1}%",
             sys.psi_some_avg10, sys.psi_full_avg10
@@ -89,66 +103,68 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
-    let base = app
+
+    let baseline_suffix = app
         .baseline_system_pss_kb
-        .map(|b| {
-            format!(
-                " | Base~: {:+.1} MiB",
-                signed_diff(sys.total_process_pss_kb, b) as f64 / 1024.0
-            )
+        .map(|base_kb| {
+            let diff_mib = signed_diff(sys.total_process_pss_kb, base_kb) as f64 / 1024.0;
+            format!(" | Base~: {diff_mib:+.1} MiB")
         })
         .unwrap_or_default();
 
-    let lines = vec![
+    let cache_and_buffers_kb = sys.cached_kb.saturating_add(sys.buffers_kb);
+
+    let summary_lines = vec![
         Line::from(vec![
-            Span::styled("Memory: ", label),
+            Span::styled("Memory: ", label_style),
             Span::raw(format!(
                 "{:.1} / {:.1} GiB ({:.1}%)",
                 to_gib(sys.used_kb),
                 to_gib(sys.total_kb),
-                pct(sys.used_kb, sys.total_kb)
+                percentage(sys.used_kb, sys.total_kb)
             )),
         ]),
         Line::from(vec![
-            Span::styled("Available: ", label),
+            Span::styled("Available: ", label_style),
             Span::raw(format!(
                 "{:.1} GiB | Cache/Buffers: {:.1} GiB",
                 to_gib(sys.available_kb),
-                to_gib(sys.cached_kb.saturating_add(sys.buffers_kb))
+                to_gib(cache_and_buffers_kb)
             )),
         ]),
         Line::from(vec![
-            Span::styled("Swap: ", label),
+            Span::styled("Swap: ", label_style),
             Span::raw(format!(
                 "{:.1} / {:.1} GiB ({:.1}%){}",
                 to_gib(sys.swap_used_kb),
                 to_gib(sys.swap_total_kb),
-                pct(sys.swap_used_kb, sys.swap_total_kb),
-                swap_io
+                percentage(sys.swap_used_kb, sys.swap_total_kb),
+                swap_rate_suffix
             )),
         ]),
         Line::from(vec![
-            Span::styled("Process PSS: ", label),
+            Span::styled("Process PSS: ", label_style),
             Span::raw(format!(
                 "{:.1} GiB | RSS: {:.1} GiB{}",
                 to_gib(sys.total_process_pss_kb),
                 to_gib(sys.total_process_rss_kb),
-                base
+                baseline_suffix
             )),
         ]),
         Line::from(vec![
-            Span::styled("Pressure: ", label),
-            Span::styled(p_txt, p_style),
-            Span::raw(psi),
+            Span::styled("Pressure: ", label_style),
+            Span::styled(pressure_text, pressure_style),
+            Span::raw(psi_suffix),
         ]),
     ];
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("System Memory"),
-        ),
-        cols[0],
+
+    let summary_block = Block::default()
+        .borders(Borders::ALL)
+        .title("System Memory");
+
+    frame.render_widget(
+        Paragraph::new(summary_lines).block(summary_block),
+        columns[0],
     );
 
     let spark_color = if sys.pressure_level == PressureLevel::Critical {
@@ -156,165 +172,180 @@ fn draw_system_stats(f: &mut Frame, area: Rect, app: &App) {
     } else {
         COLOR_SECONDARY
     };
-    let spark = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Memory Trend (60s)"),
-        )
+
+    let trend_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Memory Trend (60s)");
+
+    let sparkline = Sparkline::default()
+        .block(trend_block)
         .data(&sys.history_used_kb)
         .max(sys.total_kb.max(1))
         .style(Style::default().fg(spark_color));
-    f.render_widget(spark, cols[1]);
+
+    frame.render_widget(sparkline, columns[1]);
 }
 
-fn draw_process_list(f: &mut Frame, area: Rect, app: &mut App) {
-    let h_style = Style::default()
+fn draw_process_list(frame: &mut Frame, area: Rect, app: &mut App) {
+    let header_style = Style::default()
         .fg(COLOR_SECONDARY)
         .add_modifier(Modifier::BOLD);
-    let id_hdr = if app.grouped { "Count" } else { "PID" };
-    let d_hdr = if app.baseline_system_pss_kb.is_some() {
+
+    let id_header = if app.grouped { "Count" } else { "PID" };
+    let delta_header = if app.baseline_system_pss_kb.is_some() {
         "Base~"
     } else {
         "Delta"
     };
-    let header = Row::new(
-        [
-            id_hdr, "Name", "PSS", "RSS", "Shared", "Private", "Swap", d_hdr,
-        ]
+
+    let column_titles = [
+        id_header,
+        "Name",
+        "PSS",
+        "RSS",
+        "Shared",
+        "Private",
+        "Swap",
+        delta_header,
+    ];
+
+    let header_cells = column_titles
         .into_iter()
-        .map(|h| Text::from(h).style(h_style)),
-    )
-    .height(1)
-    .bottom_margin(1);
+        .map(|title| Text::from(title).style(header_style));
 
-    let mut leaks = 0usize;
-    let rows: Vec<Row> = app
-        .display_rows
-        .iter()
-        .map(|p| {
-            if p.is_leaking {
-                leaks += 1;
-            }
-            let d_mb = p.pss_delta_kb / 1024;
-            let style = if p.is_leaking {
-                Style::default()
-                    .fg(COLOR_ALERT)
-                    .add_modifier(Modifier::BOLD)
-            } else if p.pss_delta_kb.saturating_abs() > 10240 {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let id = if app.grouped {
-                format!("{}x", p.count)
-            } else {
-                p.pid.to_string()
-            };
-            let name = if p.is_leaking {
-                format!("{} [LEAK?]", p.name)
-            } else {
-                p.name.to_string()
-            };
-            Row::new([
-                id,
-                name,
-                format!("{} M", p.pss_kb / 1024),
-                format!("{} M", p.rss_kb / 1024),
-                format!("{} M", p.shared_kb / 1024),
-                format!("{} M", p.private_kb / 1024),
-                format!("{} M", p.swap_kb / 1024),
-                if d_mb != 0 {
-                    format!("{d_mb:+}")
-                } else {
-                    "-".into()
-                },
-            ])
-            .style(style)
-        })
-        .collect();
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
 
-    let sort_lbl = match app.sort_mode {
-        SortMode::Pss => "PSS",
-        SortMode::Rss => "RSS",
-        SortMode::Shared => "Shared",
-        SortMode::Private => "Private",
-        SortMode::Swap => "Swap",
-        SortMode::Delta => "Delta",
-        SortMode::Name => "Name",
-        SortMode::Pid => {
-            if app.grouped {
-                "Count"
-            } else {
-                "PID"
-            }
+    let mut leaking_count = 0usize;
+    let mut table_rows = Vec::with_capacity(app.display_rows.len());
+
+    for row in &app.display_rows {
+        if row.is_leaking {
+            leaking_count += 1;
         }
+        table_rows.push(format_process_row(row, app.grouped));
+    }
+
+    let title = format_process_table_title(app, leaking_count);
+    let highlight_style = Style::default()
+        .bg(COLOR_SECONDARY)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+
+    let table = Table::new(table_rows, TABLE_CONSTRAINTS)
+        .header(header)
+        .highlight_style(highlight_style)
+        .block(Block::default().borders(Borders::ALL).title(title));
+
+    frame.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+fn format_process_row(row: &DisplayRow, grouped: bool) -> Row<'static> {
+    let row_style = if row.is_leaking {
+        Style::default()
+            .fg(COLOR_ALERT)
+            .add_modifier(Modifier::BOLD)
+    } else if row.pss_delta_kb.saturating_abs() > SIGNIFICANT_DELTA_KB {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
     };
-    let pos = if app.display_rows.is_empty() {
+
+    let id_cell = if grouped {
+        format!("{}x", row.count)
+    } else {
+        row.pid.to_string()
+    };
+
+    let name_cell = if row.is_leaking {
+        format!("{} [LEAK?]", row.name)
+    } else {
+        row.name.to_string()
+    };
+
+    let delta_mib = row.pss_delta_kb / 1024;
+    let delta_cell = if delta_mib != 0 {
+        format!("{delta_mib:+}")
+    } else {
+        String::from("-")
+    };
+
+    Row::new([
+        id_cell,
+        name_cell,
+        format!("{} M", row.pss_kb / 1024),
+        format!("{} M", row.rss_kb / 1024),
+        format!("{} M", row.shared_kb / 1024),
+        format!("{} M", row.private_kb / 1024),
+        format!("{} M", row.swap_kb / 1024),
+        delta_cell,
+    ])
+    .style(row_style)
+}
+
+fn format_process_table_title(app: &App, leaking_count: usize) -> String {
+    let position = if app.display_rows.is_empty() {
         0
     } else {
         app.selected_index + 1
     };
-    let title = format!(
-        "Processes ({}/{}) [Sort: {}]{}{}{}{}",
-        pos,
-        app.display_rows.len(),
-        sort_lbl,
-        if app.grouped { " [Grouped]" } else { "" },
-        if app.baseline_system_pss_kb.is_some() {
-            " [Base~]"
-        } else {
-            ""
-        },
-        if app.search_query.is_empty() {
-            String::new()
-        } else {
-            format!(" [Filter: {}]", app.search_query)
-        },
-        if leaks > 0 {
-            format!(" [Leaks: {leaks}]")
-        } else {
-            String::new()
-        }
-    );
-    let hl = Style::default()
-        .bg(COLOR_SECONDARY)
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD);
-    let table = Table::new(rows, TABLE_CONSTRAINTS)
-        .header(header)
-        .highlight_style(hl)
-        .block(Block::default().borders(Borders::ALL).title(title));
-    f.render_stateful_widget(table, area, &mut app.table_state);
+
+    let total = app.display_rows.len();
+    let sort_label = app.sort_mode.label(app.grouped);
+
+    let mut title = format!("Processes ({position}/{total}) [Sort: {sort_label}]");
+
+    if app.grouped {
+        title.push_str(" [Grouped]");
+    }
+
+    if app.baseline_system_pss_kb.is_some() {
+        title.push_str(" [Base~]");
+    }
+
+    if !app.search_query.is_empty() {
+        title.push_str(&format!(" [Filter: {}]", app.search_query));
+    }
+
+    if leaking_count > 0 {
+        title.push_str(&format!(" [Leaks: {leaking_count}]"));
+    }
+
+    title
 }
 
-fn draw_inspector_modal(f: &mut Frame, area: Rect, app: &App) {
-    let Some(p) = app.display_rows.get(app.selected_index) else {
+fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(proc_row) = app.display_rows.get(app.selected_index) else {
         return;
     };
-    f.render_widget(Clear, area);
-    let title = if p.count > 1 {
-        format!(" {} ({}x) ", p.name, p.count)
+
+    frame.render_widget(Clear, area);
+
+    let title = if proc_row.count > 1 {
+        format!(" {} ({}x) ", proc_row.name, proc_row.count)
     } else {
-        format!(" {} [PID {}] ", p.name, p.pid)
+        format!(" {} [PID {}] ", proc_row.name, proc_row.pid)
     };
-    let block = Block::default()
+
+    let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLOR_SECONDARY))
         .title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner_area = outer_block.inner(area);
 
-    let chunks = Layout::default()
+    frame.render_widget(outer_block, area);
+
+    let modal_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(8), Constraint::Length(4)])
-        .split(inner);
-    let label = Style::default()
+        .split(inner_area);
+
+    let label_style = Style::default()
         .fg(COLOR_SECONDARY)
         .add_modifier(Modifier::BOLD);
-    let status = if p.is_leaking {
+
+    let status_span = if proc_row.is_leaking {
         Span::styled(
-            format!("LEAK (+{} KB/s)", p.leak_rate_kb),
+            format!("LEAK (+{} KB/s)", proc_row.leak_rate_kb),
             Style::default()
                 .fg(COLOR_ALERT)
                 .add_modifier(Modifier::BOLD),
@@ -322,203 +353,234 @@ fn draw_inspector_modal(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Span::styled("Healthy", Style::default().fg(COLOR_HEALTHY))
     };
-    let b = app.inspector_breakdown.clone().unwrap_or(MemoryBreakdown {
+
+    let breakdown = app.inspector_breakdown.clone().unwrap_or(MemoryBreakdown {
         heap_kb: 0,
         stack_kb: 0,
-        anon_kb: p.private_kb,
-        libs_kb: p.shared_kb,
+        anon_kb: proc_row.private_kb,
+        libs_kb: proc_row.shared_kb,
     });
-    let cmd = if p.cmdline.is_empty() {
-        p.name.as_ref()
+
+    let command_text = if proc_row.cmdline.is_empty() {
+        proc_row.name.as_ref()
     } else {
-        p.cmdline.as_ref()
+        proc_row.cmdline.as_ref()
     };
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("Status: ", label),
-            status,
+            Span::styled("Status: ", label_style),
+            status_span,
             Span::raw("   "),
-            Span::styled("Cmd: ", label),
-            Span::raw(cmd),
+            Span::styled("Cmd: ", label_style),
+            Span::raw(command_text),
         ]),
         Line::from(vec![
-            Span::styled("Memory: ", label),
+            Span::styled("Memory: ", label_style),
             Span::raw(format!(
                 "PSS {:.1}M | Private {:.1}M | Shared {:.1}M | Swap {:.1}M",
-                to_mib(p.pss_kb),
-                to_mib(p.private_kb),
-                to_mib(p.shared_kb),
-                to_mib(p.swap_kb)
+                to_mib(proc_row.pss_kb),
+                to_mib(proc_row.private_kb),
+                to_mib(proc_row.shared_kb),
+                to_mib(proc_row.swap_kb)
             )),
         ]),
         Line::from(""),
     ];
-    for (name, kb, col) in [
-        ("Heap", b.heap_kb, COLOR_SECONDARY),
-        ("Stack", b.stack_kb, COLOR_PRIMARY),
-        ("Anon", b.anon_kb, COLOR_PRIMARY),
-        ("Libs", b.libs_kb, COLOR_SECONDARY),
-    ] {
-        let ratio = pct(kb, p.pss_kb.max(1));
-        let bar = "#".repeat(((ratio.clamp(0.0, 100.0) / 100.0) * 24.0) as usize);
+
+    let segments = [
+        ("Heap", breakdown.heap_kb, COLOR_SECONDARY),
+        ("Stack", breakdown.stack_kb, COLOR_PRIMARY),
+        ("Anon", breakdown.anon_kb, COLOR_PRIMARY),
+        ("Libs", breakdown.libs_kb, COLOR_SECONDARY),
+    ];
+
+    let pss_base = proc_row.pss_kb.max(1);
+    for (segment_name, segment_kb, color) in segments {
+        let ratio = percentage(segment_kb, pss_base);
+        let bar = ascii_bar(ratio, 24);
         lines.push(Line::from(vec![
-            Span::styled(format!("{name:7} "), Style::default().fg(col)),
-            Span::raw(format!("{:7.1}M ({:4.1}%) ", to_mib(kb), ratio)),
-            Span::styled(bar, Style::default().fg(col)),
+            Span::styled(format!("{segment_name:7} "), Style::default().fg(color)),
+            Span::raw(format!("{:7.1}M ({:4.1}%) ", to_mib(segment_kb), ratio)),
+            Span::styled(bar, Style::default().fg(color)),
         ]));
     }
-    f.render_widget(Paragraph::new(lines), chunks[0]);
 
-    let max_pss = p.pss_history.iter().copied().max().unwrap_or(1).max(1);
-    let spark = Sparkline::default()
+    frame.render_widget(Paragraph::new(lines), modal_chunks[0]);
+
+    let max_pss = proc_row
+        .pss_history
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let spark_color = if proc_row.is_leaking {
+        COLOR_ALERT
+    } else {
+        COLOR_SECONDARY
+    };
+
+    let sparkline = Sparkline::default()
         .block(
             Block::default()
                 .borders(Borders::TOP)
-                .title("60s Trend (Esc: close | k: kill)"),
+                .title("60s Trend (Esc: close | k: kill | b: base~)"),
         )
-        .data(&p.pss_history)
+        .data(&proc_row.pss_history)
         .max(max_pss)
-        .style(Style::default().fg(if p.is_leaking {
-            COLOR_ALERT
-        } else {
-            COLOR_SECONDARY
-        }));
-    f.render_widget(spark, chunks[1]);
+        .style(Style::default().fg(spark_color));
+
+    frame.render_widget(sparkline, modal_chunks[1]);
 }
 
-fn draw_memory_map(f: &mut Frame, area: Rect, app: &App) {
-    let (m, total) = (&app.state.memory_map, app.state.system.total_kb);
-    let hdr = Style::default()
+fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
+    let map = &app.state.memory_map;
+    let total_kb = app.state.system.total_kb;
+    let header_style = Style::default()
         .fg(COLOR_SECONDARY)
         .add_modifier(Modifier::BOLD);
+
     let mut lines = vec![
-        Line::from(Span::styled("Physical Memory Distribution:", hdr)),
+        Line::from(Span::styled("Physical Memory Distribution:", header_style)),
         Line::from(""),
     ];
-    for (lbl, kb, col) in [
-        ("Kernel", m.kernel_kb, COLOR_SECONDARY),
-        ("Process Private", m.process_private_kb, COLOR_PRIMARY),
-        ("Process Shared", m.process_shared_kb, COLOR_PRIMARY),
-        ("Page Cache", m.cache_kb, COLOR_PRIMARY),
-        ("Buffers", m.buffers_kb, COLOR_PRIMARY),
-        ("Slab", m.slab_kb, COLOR_PRIMARY),
-        ("Page Tables", m.page_tables_kb, COLOR_PRIMARY),
-        ("Free", m.free_kb, COLOR_SECONDARY),
-    ] {
-        let p = pct(kb, total);
-        let bar = "#".repeat(((p.clamp(0.0, 100.0) / 100.0) * 45.0) as usize);
+
+    let categories = [
+        ("Kernel", map.kernel_kb, COLOR_SECONDARY),
+        ("Process Private", map.process_private_kb, COLOR_PRIMARY),
+        ("Process Shared", map.process_shared_kb, COLOR_PRIMARY),
+        ("Page Cache", map.cache_kb, COLOR_PRIMARY),
+        ("Buffers", map.buffers_kb, COLOR_PRIMARY),
+        ("Slab", map.slab_kb, COLOR_PRIMARY),
+        ("Page Tables", map.page_tables_kb, COLOR_PRIMARY),
+        ("Free", map.free_kb, COLOR_SECONDARY),
+    ];
+
+    for (label, kb, color) in categories {
+        let pct = percentage(kb, total_kb);
+        let bar = ascii_bar(pct, 45);
         lines.push(Line::from(vec![
-            Span::styled(format!("{lbl:16} "), Style::default().fg(col)),
-            Span::raw(format!("{:7.1} GiB ({:5.1}%) ", to_gib(kb), p)),
-            Span::styled(bar, Style::default().fg(col)),
+            Span::styled(format!("{label:16} "), Style::default().fg(color)),
+            Span::raw(format!("{:7.1} GiB ({:5.1}%) ", to_gib(kb), pct)),
+            Span::styled(bar, Style::default().fg(color)),
         ]));
     }
+
     if !app.state.numa_nodes.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("NUMA Nodes:", hdr)));
-        for n in &app.state.numa_nodes {
+        lines.push(Line::from(Span::styled("NUMA Nodes:", header_style)));
+
+        for node in &app.state.numa_nodes {
+            let used_pct = percentage(node.mem_used_kb, node.mem_total_kb);
             lines.push(Line::from(format!(
                 "  Node {}: {:.1} / {:.1} GiB ({:.1}%)",
-                n.node_id,
-                to_gib(n.mem_used_kb),
-                to_gib(n.mem_total_kb),
-                pct(n.mem_used_kb, n.mem_total_kb)
+                node.node_id,
+                to_gib(node.mem_used_kb),
+                to_gib(node.mem_total_kb),
+                used_pct
             )));
         }
     }
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Physical Memory Map"),
-        ),
-        area,
-    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Physical Memory Map");
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_shared_view(f: &mut Frame, area: Rect, app: &App) {
-    let s = &app.state.shared_memory;
-    let (pri, sec) = (
-        Style::default().fg(COLOR_PRIMARY),
-        Style::default().fg(COLOR_SECONDARY),
-    );
+fn draw_shared_view(frame: &mut Frame, area: Rect, app: &App) {
+    let shared = &app.state.shared_memory;
+    let primary = Style::default().fg(COLOR_PRIMARY);
+    let secondary = Style::default().fg(COLOR_SECONDARY);
+
     let lines = vec![
         Line::from(vec![
-            Span::styled("Total Shared Memory: ", sec),
-            Span::raw(format!("{:.1} GiB", to_gib(s.total_shared_kb))),
+            Span::styled("Total Shared Memory: ", secondary),
+            Span::raw(format!("{:.1} GiB", to_gib(shared.total_shared_kb))),
         ]),
         Line::from(vec![
-            Span::styled("  Clean: ", pri),
-            Span::raw(format!("{:.1} GiB", to_gib(s.total_shared_clean_kb))),
+            Span::styled("  Clean: ", primary),
+            Span::raw(format!("{:.1} GiB", to_gib(shared.total_shared_clean_kb))),
         ]),
         Line::from(vec![
-            Span::styled("  Dirty: ", pri),
-            Span::raw(format!("{:.1} GiB", to_gib(s.total_shared_dirty_kb))),
+            Span::styled("  Dirty: ", primary),
+            Span::raw(format!("{:.1} GiB", to_gib(shared.total_shared_dirty_kb))),
         ]),
         Line::from(vec![
-            Span::styled("Sharing Efficiency: ", sec),
-            Span::raw(format!("{:.1}%", s.sharing_efficiency)),
+            Span::styled("Sharing Efficiency: ", secondary),
+            Span::raw(format!("{:.1}%", shared.sharing_efficiency)),
         ]),
     ];
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Shared Memory Analysis"),
-        ),
-        area,
-    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Shared Memory Analysis");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_help(f: &mut Frame, area: Rect, app: &App) {
-    let sec = Style::default().fg(COLOR_SECONDARY);
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let secondary = Style::default().fg(COLOR_SECONDARY);
+
     if app.searching {
-        let line = Line::from(vec![
-            Span::styled("Search: ", sec.add_modifier(Modifier::BOLD)),
+        let search_line = Line::from(vec![
+            Span::styled("Search: ", secondary.add_modifier(Modifier::BOLD)),
             Span::raw(&app.search_query),
-            Span::styled("_", sec),
+            Span::styled("_", secondary),
             Span::raw("  (Enter: lock | Esc: clear)"),
         ]);
-        f.render_widget(
-            Paragraph::new(vec![line])
-                .block(Block::default().borders(Borders::ALL).title("Filter")),
-            area,
-        );
+
+        let block = Block::default().borders(Borders::ALL).title("Filter");
+        frame.render_widget(Paragraph::new(vec![search_line]).block(block), area);
+
         return;
     }
-    let next_v = match app.view_mode {
-        ViewMode::Processes => "map",
-        ViewMode::MemoryMap => "shared",
-        ViewMode::SharedMemory => "process",
+
+    let next_view = app.view_mode.next_label();
+
+    let controls_line = if app.inspecting {
+        Line::from(vec![Span::raw(
+            "Esc/Enter: close | Up/Down: prev/next | k: kill | b/Space: base~ | q: quit",
+        )])
+    } else if app.is_process_view() {
+        Line::from(vec![
+            Span::raw(
+                "q: quit | Enter: inspect | /: search | g: group | n: sort | k: kill | b: base~ | v: ",
+            ),
+            Span::styled(next_view, secondary),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("q: quit | b/Space: base~ | v: "),
+            Span::styled(next_view, secondary),
+            Span::raw(" view"),
+        ])
     };
-    let line = Line::from(vec![
-        Span::raw(
-            "q: quit | Enter: inspect | b/Space: base~ | /: search | g: group | k: kill | n: sort | v: ",
-        ),
-        Span::styled(next_v, sec),
-    ]);
-    f.render_widget(
-        Paragraph::new(vec![line]).block(Block::default().borders(Borders::ALL).title("Controls")),
-        area,
-    );
+
+    let block = Block::default().borders(Borders::ALL).title("Controls");
+    frame.render_widget(Paragraph::new(vec![controls_line]).block(block), area);
 }
 
-fn centered_rect(px: u16, py: u16, r: Rect) -> Rect {
-    let v = Layout::default()
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let margin_y = (100 - percent_y) / 2;
+    let margin_x = (100 - percent_x) / 2;
+
+    let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage((100 - py) / 2),
-            Constraint::Percentage(py),
-            Constraint::Percentage((100 - py) / 2),
+            Constraint::Percentage(margin_y),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage(margin_y),
         ])
-        .split(r);
+        .split(area);
+
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage((100 - px) / 2),
-            Constraint::Percentage(px),
-            Constraint::Percentage((100 - px) / 2),
+            Constraint::Percentage(margin_x),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage(margin_x),
         ])
-        .split(v[1])[1]
+        .split(vertical[1])[1]
 }
