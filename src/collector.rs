@@ -1,16 +1,16 @@
-use anyhow::{Context, Result};
-use std::collections::HashSet;
+use anyhow::Result;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
+use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, System};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MemorySnapshot {
     pub processes: Vec<ProcessMemory>,
     pub system: SystemMemory,
     pub numa_nodes: Vec<NumaNode>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProcessMemory {
     pub pid: u32,
     pub name: String,
@@ -23,7 +23,7 @@ pub struct ProcessMemory {
     pub swap_kb: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SystemMemory {
     pub total_kb: u64,
     pub free_kb: u64,
@@ -36,7 +36,7 @@ pub struct SystemMemory {
     pub page_tables_kb: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NumaNode {
     pub node_id: u32,
     pub mem_total_kb: u64,
@@ -45,22 +45,26 @@ pub struct NumaNode {
 }
 
 pub struct Collector {
-    known_pids: HashSet<u32>,
-    proc_path: PathBuf,
+    sys: System,
 }
 
 impl Collector {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            known_pids: HashSet::new(),
-            proc_path: PathBuf::from("/proc"),
-        })
+        Ok(Self { sys: System::new() })
     }
 
     pub fn collect(&mut self) -> Result<MemorySnapshot> {
-        let system = self.collect_system_memory()?;
-        let numa_nodes = self.collect_numa_info()?;
-        let processes = self.collect_process_memory()?;
+        self.sys
+            .refresh_memory_specifics(MemoryRefreshKind::everything());
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+
+        let system = self.collect_system_memory();
+        let processes = self.collect_processes();
+        let numa_nodes = self.collect_numa_info();
 
         Ok(MemorySnapshot {
             processes,
@@ -69,175 +73,176 @@ impl Collector {
         })
     }
 
-    fn collect_system_memory(&self) -> Result<SystemMemory> {
-        let content = fs::read_to_string("/proc/meminfo")
-            .context("Failed to read /proc/meminfo")?;
-
+    fn collect_system_memory(&self) -> SystemMemory {
         let mut mem = SystemMemory {
-            total_kb: 0,
-            free_kb: 0,
-            available_kb: 0,
-            buffers_kb: 0,
-            cached_kb: 0,
-            swap_total_kb: 0,
-            swap_free_kb: 0,
-            slab_kb: 0,
-            page_tables_kb: 0,
+            total_kb: self.sys.total_memory() / 1024,
+            free_kb: self.sys.free_memory() / 1024,
+            available_kb: self.sys.available_memory() / 1024,
+            swap_total_kb: self.sys.total_swap() / 1024,
+            swap_free_kb: self.sys.free_swap() / 1024,
+            ..Default::default()
         };
 
-        for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let value = parts[1].parse::<u64>().unwrap_or(0);
-
-            match parts[0] {
-                "MemTotal:" => mem.total_kb = value,
-                "MemFree:" => mem.free_kb = value,
-                "MemAvailable:" => mem.available_kb = value,
-                "Buffers:" => mem.buffers_kb = value,
-                "Cached:" => mem.cached_kb = value,
-                "SwapTotal:" => mem.swap_total_kb = value,
-                "SwapFree:" => mem.swap_free_kb = value,
-                "Slab:" => mem.slab_kb = value,
-                "PageTables:" => mem.page_tables_kb = value,
-                _ => {}
-            }
+        if mem.available_kb == 0 {
+            mem.available_kb = mem.free_kb;
         }
 
-        Ok(mem)
-    }
-
-    fn collect_numa_info(&self) -> Result<Vec<NumaNode>> {
-        let mut nodes = Vec::new();
-        let sys_node_path = PathBuf::from("/sys/devices/system/node");
-
-        if !sys_node_path.exists() {
-            return Ok(nodes);
-        }
-
-        let entries = fs::read_dir(&sys_node_path).context("Failed to read NUMA nodes")?;
-
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if !name_str.starts_with("node") {
-                continue;
-            }
-
-            if let Some(node_id) = name_str.strip_prefix("node").and_then(|s| s.parse::<u32>().ok()) {
-                let meminfo_path = entry.path().join("meminfo");
-                if let Ok(content) = fs::read_to_string(meminfo_path) {
-                    let mut node = NumaNode {
-                        node_id,
-                        mem_total_kb: 0,
-                        mem_free_kb: 0,
-                        mem_used_kb: 0,
-                    };
-
-                    for line in content.lines() {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() < 4 {
-                            continue;
-                        }
-
-                        let value = parts[3].parse::<u64>().unwrap_or(0);
-
-                        if line.contains("MemTotal:") {
-                            node.mem_total_kb = value;
-                        } else if line.contains("MemFree:") {
-                            node.mem_free_kb = value;
-                        } else if line.contains("MemUsed:") {
-                            node.mem_used_kb = value;
-                        }
+        if let Ok(content) = fs::read_to_string("/proc/meminfo") {
+            for line in content.lines() {
+                let mut parts = line.split_whitespace();
+                if let (Some(key), Some(val_str)) = (parts.next(), parts.next()) {
+                    let val = val_str.parse::<u64>().unwrap_or(0);
+                    match key {
+                        "Buffers:" => mem.buffers_kb = val,
+                        "Cached:" => mem.cached_kb = val,
+                        "Slab:" => mem.slab_kb = val,
+                        "PageTables:" => mem.page_tables_kb = val,
+                        _ => {}
                     }
-
-                    if node.mem_used_kb == 0 {
-                        node.mem_used_kb = node.mem_total_kb.saturating_sub(node.mem_free_kb);
-                    }
-
-                    nodes.push(node);
                 }
             }
+        } else {
+            let used_kb = self.sys.used_memory() / 1024;
+            mem.cached_kb = mem
+                .total_kb
+                .saturating_sub(used_kb)
+                .saturating_sub(mem.free_kb);
         }
 
-        nodes.sort_by_key(|n| n.node_id);
-        Ok(nodes)
+        mem
     }
 
-    fn collect_process_memory(&mut self) -> Result<Vec<ProcessMemory>> {
-        let mut processes = Vec::new();
-        let mut current_pids = HashSet::new();
-
-        let entries = fs::read_dir(&self.proc_path).context("Failed to read /proc")?;
-
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if let Ok(pid) = name_str.parse::<u32>() {
-                current_pids.insert(pid);
-
-                let smaps_path = entry.path().join("smaps_rollup");
-
-                if let Ok(proc_mem) = self.parse_smaps_rollup(pid, &smaps_path) {
-                    processes.push(proc_mem);
+    fn collect_processes(&self) -> Vec<ProcessMemory> {
+        self.sys
+            .processes()
+            .iter()
+            .filter_map(|(&pid, proc_info)| {
+                if proc_info.thread_kind().is_some() {
+                    return None;
                 }
-            }
-        }
 
-        self.known_pids = current_pids;
+                let rss_kb = proc_info.memory() / 1024;
+                if rss_kb == 0 {
+                    return None;
+                }
 
-        Ok(processes)
+                let upid = pid.as_u32();
+                let vmem_kb = proc_info.virtual_memory() / 1024;
+
+                let raw_name = proc_info.name().to_string_lossy();
+                let name = raw_name
+                    .trim()
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect::<String>();
+
+                let proc_name = if name.is_empty() {
+                    format!("[{}]", upid)
+                } else {
+                    name
+                };
+
+                if let Some(detailed) = Self::read_smaps(upid, proc_name.clone()) {
+                    return Some(detailed);
+                }
+
+                let swap_kb = vmem_kb.saturating_sub(rss_kb);
+
+                Some(ProcessMemory {
+                    pid: upid,
+                    name: proc_name,
+                    rss_kb,
+                    pss_kb: rss_kb,
+                    shared_clean_kb: 0,
+                    shared_dirty_kb: 0,
+                    private_clean_kb: 0,
+                    private_dirty_kb: rss_kb,
+                    swap_kb,
+                })
+            })
+            .collect()
     }
 
-    fn parse_smaps_rollup(&self, pid: u32, path: &PathBuf) -> Result<ProcessMemory> {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read smaps_rollup for PID {}", pid))?;
+    fn read_smaps(pid: u32, name: String) -> Option<ProcessMemory> {
+        let content = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
 
         let mut mem = ProcessMemory {
             pid,
-            name: self.get_process_name(pid),
-            rss_kb: 0,
-            pss_kb: 0,
-            shared_clean_kb: 0,
-            shared_dirty_kb: 0,
-            private_clean_kb: 0,
-            private_dirty_kb: 0,
-            swap_kb: 0,
+            name,
+            ..Default::default()
         };
 
         for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let value = parts[1].parse::<u64>().unwrap_or(0);
-
-            match parts[0] {
-                "Rss:" => mem.rss_kb = value,
-                "Pss:" => mem.pss_kb = value,
-                "Shared_Clean:" => mem.shared_clean_kb = value,
-                "Shared_Dirty:" => mem.shared_dirty_kb = value,
-                "Private_Clean:" => mem.private_clean_kb = value,
-                "Private_Dirty:" => mem.private_dirty_kb = value,
-                "Swap:" => mem.swap_kb = value,
-                _ => {}
+            let mut parts = line.split_whitespace();
+            if let (Some(key), Some(val_str)) = (parts.next(), parts.next()) {
+                let val = val_str.parse::<u64>().unwrap_or(0);
+                match key {
+                    "Rss:" => mem.rss_kb = val,
+                    "Pss:" => mem.pss_kb = val,
+                    "Shared_Clean:" => mem.shared_clean_kb = val,
+                    "Shared_Dirty:" => mem.shared_dirty_kb = val,
+                    "Private_Clean:" => mem.private_clean_kb = val,
+                    "Private_Dirty:" => mem.private_dirty_kb = val,
+                    "Swap:" => mem.swap_kb = val,
+                    _ => {}
+                }
             }
         }
 
-        Ok(mem)
+        if mem.rss_kb == 0 && mem.pss_kb == 0 && mem.swap_kb == 0 {
+            None
+        } else {
+            Some(mem)
+        }
     }
 
-    fn get_process_name(&self, pid: u32) -> String {
-        let comm_path = self.proc_path.join(pid.to_string()).join("comm");
-        fs::read_to_string(comm_path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| format!("[{}]", pid))
+    fn collect_numa_info(&self) -> Vec<NumaNode> {
+        let Ok(entries) = fs::read_dir(Path::new("/sys/devices/system/node")) else {
+            return Vec::new();
+        };
+
+        let mut nodes: Vec<NumaNode> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let node_id = name
+                    .to_string_lossy()
+                    .strip_prefix("node")?
+                    .parse::<u32>()
+                    .ok()?;
+                let content = fs::read_to_string(entry.path().join("meminfo")).ok()?;
+
+                let mut node = NumaNode {
+                    node_id,
+                    ..Default::default()
+                };
+                let mut has_used = false;
+
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let val = parts[3].parse::<u64>().unwrap_or(0);
+                        match parts[2] {
+                            "MemTotal:" => node.mem_total_kb = val,
+                            "MemFree:" => node.mem_free_kb = val,
+                            "MemUsed:" => {
+                                node.mem_used_kb = val;
+                                has_used = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if !has_used {
+                    node.mem_used_kb = node.mem_total_kb.saturating_sub(node.mem_free_kb);
+                }
+
+                Some(node)
+            })
+            .collect();
+
+        nodes.sort_by_key(|n| n.node_id);
+        nodes
     }
 }

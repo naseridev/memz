@@ -2,19 +2,17 @@
 name = "memz"
 version = "1.0.0"
 edition = "2024"
-authors = ["Nima Naseri <nerdnull@proton.me>"]
-description = "Advanced Linux memory analyzer with PSS tracking"
+authors = ["Nima Naseri nerdnull@proton.me"]
+description = "Memory analyzer with PSS tracking"
 repository = "https://github.com/naseridev/memz"
-keywords = ["memory", "linux", "monitoring", "system"]
+keywords = ["memory", "monitoring", "system", "cross-platform"]
 categories = ["command-line-utilities"]
 
 [dependencies]
 ratatui = "0.28"
 crossterm = "0.28"
 anyhow = "1.0"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+sysinfo = "0.33"
 
 [profile.release]
 opt-level = 3

@@ -1,7 +1,7 @@
-use crate::collector::{MemorySnapshot, ProcessMemory, SystemMemory, NumaNode};
+use crate::collector::{MemorySnapshot, NumaNode, ProcessMemory, SystemMemory};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AnalyzedState {
     pub processes: Vec<ProcessStats>,
     pub system: SystemStats,
@@ -10,7 +10,7 @@ pub struct AnalyzedState {
     pub memory_map: MemoryMap,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProcessStats {
     pub pid: u32,
     pub name: String,
@@ -22,7 +22,7 @@ pub struct ProcessStats {
     pub pss_delta_kb: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SystemStats {
     pub total_kb: u64,
     pub used_kb: u64,
@@ -35,7 +35,7 @@ pub struct SystemStats {
     pub total_process_rss_kb: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SharedMemoryStats {
     pub total_shared_kb: u64,
     pub total_shared_clean_kb: u64,
@@ -43,7 +43,7 @@ pub struct SharedMemoryStats {
     pub sharing_efficiency: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MemoryMap {
     pub kernel_kb: u64,
     pub process_private_kb: u64,
@@ -55,6 +55,7 @@ pub struct MemoryMap {
     pub page_tables_kb: u64,
 }
 
+#[derive(Default)]
 pub struct Analyzer {
     last_snapshot: Option<MemorySnapshot>,
     process_history: HashMap<u32, u64>,
@@ -62,10 +63,7 @@ pub struct Analyzer {
 
 impl Analyzer {
     pub fn new() -> Self {
-        Self {
-            last_snapshot: None,
-            process_history: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn update(&mut self, snapshot: MemorySnapshot) {
@@ -73,9 +71,8 @@ impl Analyzer {
     }
 
     pub fn get_state(&mut self) -> AnalyzedState {
-        let snapshot = match &self.last_snapshot {
-            Some(s) => s.clone(),
-            None => return self.empty_state(),
+        let Some(snapshot) = self.last_snapshot.take() else {
+            return AnalyzedState::default();
         };
 
         let processes = self.analyze_processes(&snapshot.processes);
@@ -93,35 +90,45 @@ impl Analyzer {
     }
 
     fn analyze_processes(&mut self, processes: &[ProcessMemory]) -> Vec<ProcessStats> {
-        let mut stats = Vec::with_capacity(processes.len());
-        let mut new_history = HashMap::new();
+        let mut new_history = HashMap::with_capacity(processes.len());
+        let stats = processes
+            .iter()
+            .map(|proc| {
+                let last_pss = self
+                    .process_history
+                    .get(&proc.pid)
+                    .copied()
+                    .unwrap_or(proc.pss_kb);
 
-        for proc in processes {
-            let last_pss = self.process_history.get(&proc.pid).copied().unwrap_or(proc.pss_kb);
-            let pss_delta = proc.pss_kb as i64 - last_pss as i64;
+                let pss_delta_kb = if proc.pss_kb >= last_pss {
+                    (proc.pss_kb - last_pss).min(i64::MAX as u64) as i64
+                } else {
+                    -((last_pss - proc.pss_kb).min(i64::MAX as u64) as i64)
+                };
 
-            stats.push(ProcessStats {
-                pid: proc.pid,
-                name: proc.name.clone(),
-                pss_kb: proc.pss_kb,
-                rss_kb: proc.rss_kb,
-                shared_kb: proc.shared_clean_kb + proc.shared_dirty_kb,
-                private_kb: proc.private_clean_kb + proc.private_dirty_kb,
-                swap_kb: proc.swap_kb,
-                pss_delta_kb: pss_delta,
-            });
+                new_history.insert(proc.pid, proc.pss_kb);
 
-            new_history.insert(proc.pid, proc.pss_kb);
-        }
+                ProcessStats {
+                    pid: proc.pid,
+                    name: proc.name.clone(),
+                    pss_kb: proc.pss_kb,
+                    rss_kb: proc.rss_kb,
+                    shared_kb: proc.shared_clean_kb.saturating_add(proc.shared_dirty_kb),
+                    private_kb: proc.private_clean_kb.saturating_add(proc.private_dirty_kb),
+                    swap_kb: proc.swap_kb,
+                    pss_delta_kb,
+                }
+            })
+            .collect();
 
         self.process_history = new_history;
         stats
     }
 
     fn analyze_system(&self, system: &SystemMemory, processes: &[ProcessMemory]) -> SystemStats {
-        let total_pss: u64 = processes.iter().map(|p| p.pss_kb).sum();
-        let total_rss: u64 = processes.iter().map(|p| p.rss_kb).sum();
-        let swap_used = system.swap_total_kb.saturating_sub(system.swap_free_kb);
+        let (total_pss, total_rss) = processes.iter().fold((0u64, 0u64), |(pss, rss), p| {
+            (pss.saturating_add(p.pss_kb), rss.saturating_add(p.rss_kb))
+        });
 
         SystemStats {
             total_kb: system.total_kb,
@@ -130,54 +137,63 @@ impl Analyzer {
             cached_kb: system.cached_kb,
             buffers_kb: system.buffers_kb,
             swap_total_kb: system.swap_total_kb,
-            swap_used_kb: swap_used,
+            swap_used_kb: system.swap_total_kb.saturating_sub(system.swap_free_kb),
             total_process_pss_kb: total_pss,
             total_process_rss_kb: total_rss,
         }
     }
 
     fn analyze_shared_memory(&self, processes: &[ProcessMemory]) -> SharedMemoryStats {
-        let total_shared: u64 = processes
-            .iter()
-            .map(|p| p.shared_clean_kb + p.shared_dirty_kb)
-            .sum();
+        let (clean, dirty, rss, pss) =
+            processes
+                .iter()
+                .fold((0u64, 0u64, 0u64, 0u64), |(c, d, r, p), proc| {
+                    (
+                        c.saturating_add(proc.shared_clean_kb),
+                        d.saturating_add(proc.shared_dirty_kb),
+                        r.saturating_add(proc.rss_kb),
+                        p.saturating_add(proc.pss_kb),
+                    )
+                });
 
-        let total_shared_clean: u64 = processes.iter().map(|p| p.shared_clean_kb).sum();
-        let total_shared_dirty: u64 = processes.iter().map(|p| p.shared_dirty_kb).sum();
-
-        let total_rss: u64 = processes.iter().map(|p| p.rss_kb).sum();
-        let total_pss: u64 = processes.iter().map(|p| p.pss_kb).sum();
-
-        let efficiency = if total_rss > 0 {
-            ((total_rss - total_pss) as f64 / total_rss as f64) * 100.0
+        let efficiency = if rss > 0 {
+            (rss.saturating_sub(pss) as f64 / rss as f64) * 100.0
         } else {
             0.0
         };
 
         SharedMemoryStats {
-            total_shared_kb: total_shared,
-            total_shared_clean_kb: total_shared_clean,
-            total_shared_dirty_kb: total_shared_dirty,
+            total_shared_kb: clean.saturating_add(dirty),
+            total_shared_clean_kb: clean,
+            total_shared_dirty_kb: dirty,
             sharing_efficiency: efficiency,
         }
     }
 
     fn build_memory_map(&self, system: &SystemMemory, processes: &[ProcessMemory]) -> MemoryMap {
-        let total_private: u64 = processes
-            .iter()
-            .map(|p| p.private_clean_kb + p.private_dirty_kb)
-            .sum();
+        let (total_private, total_shared) =
+            processes
+                .iter()
+                .fold((0u64, 0u64), |(priv_acc, shar_acc), p| {
+                    (
+                        priv_acc
+                            .saturating_add(p.private_clean_kb)
+                            .saturating_add(p.private_dirty_kb),
+                        shar_acc
+                            .saturating_add(p.shared_clean_kb)
+                            .saturating_add(p.shared_dirty_kb),
+                    )
+                });
 
-        let total_shared: u64 = processes
-            .iter()
-            .map(|p| p.shared_clean_kb + p.shared_dirty_kb)
-            .sum();
-
-        let accounted = total_private + system.cached_kb + system.buffers_kb + system.free_kb + system.slab_kb + system.page_tables_kb;
-        let kernel = system.total_kb.saturating_sub(accounted);
+        let accounted = total_private
+            .saturating_add(system.cached_kb)
+            .saturating_add(system.buffers_kb)
+            .saturating_add(system.free_kb)
+            .saturating_add(system.slab_kb)
+            .saturating_add(system.page_tables_kb);
 
         MemoryMap {
-            kernel_kb: kernel,
+            kernel_kb: system.total_kb.saturating_sub(accounted),
             process_private_kb: total_private,
             process_shared_kb: total_shared,
             cache_kb: system.cached_kb,
@@ -185,40 +201,6 @@ impl Analyzer {
             free_kb: system.free_kb,
             slab_kb: system.slab_kb,
             page_tables_kb: system.page_tables_kb,
-        }
-    }
-
-    fn empty_state(&self) -> AnalyzedState {
-        AnalyzedState {
-            processes: Vec::new(),
-            system: SystemStats {
-                total_kb: 0,
-                used_kb: 0,
-                available_kb: 0,
-                cached_kb: 0,
-                buffers_kb: 0,
-                swap_total_kb: 0,
-                swap_used_kb: 0,
-                total_process_pss_kb: 0,
-                total_process_rss_kb: 0,
-            },
-            shared_memory: SharedMemoryStats {
-                total_shared_kb: 0,
-                total_shared_clean_kb: 0,
-                total_shared_dirty_kb: 0,
-                sharing_efficiency: 0.0,
-            },
-            numa_nodes: Vec::new(),
-            memory_map: MemoryMap {
-                kernel_kb: 0,
-                process_private_kb: 0,
-                process_shared_kb: 0,
-                cache_kb: 0,
-                buffers_kb: 0,
-                free_kb: 0,
-                slab_kb: 0,
-                page_tables_kb: 0,
-            },
         }
     }
 }

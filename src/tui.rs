@@ -1,82 +1,83 @@
 use crate::{engine::Engine, ui};
 use anyhow::Result;
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::DefaultTerminal;
+use std::time::Duration;
 
 pub struct Tui {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: DefaultTerminal,
     engine: Engine,
     app: ui::App,
 }
 
 impl Tui {
     pub fn new(engine: Engine) -> Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        let mut app = ui::App::new();
+        if let Some(initial) = engine.try_recv() {
+            app.update_data(initial);
+        }
 
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        let terminal = ratatui::init();
 
-        let mut tui = Self {
+        Ok(Self {
             terminal,
             engine,
-            app: ui::App::new(),
-        };
-
-        let initial = tui.engine.initial_state()?;
-        tui.app.update_data(initial);
-
-        Ok(tui)
+            app,
+        })
     }
 
     pub fn run(&mut self) -> Result<()> {
-        loop {
-            self.terminal.draw(|f| ui::draw(f, &mut self.app))?;
+        let mut needs_redraw = true;
 
-            if event::poll(std::time::Duration::from_millis(50))? {
-                if let Event::Key(k) = event::read()? {
-                    match k.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Char('n') => self.app.next_sort(),
-                        KeyCode::Char('v') => self.app.toggle_view(),
-                        KeyCode::Up => self.app.scroll_up(),
-                        KeyCode::Down => self.app.scroll_down(),
-                        KeyCode::PageUp => self.app.page_up(),
-                        KeyCode::PageDown => self.app.page_down(),
-                        _ => {}
-                    }
-                }
+        loop {
+            if let Some(state) = self.engine.try_recv() {
+                self.app.update_data(state);
+                needs_redraw = true;
             }
 
-            if self.engine.should_tick() {
-                let state = self.engine.tick()?;
-                self.app.update_data(state);
+            if needs_redraw {
+                self.terminal.draw(|f| ui::draw(f, &mut self.app))?;
+                needs_redraw = false;
+            }
+
+            if event::poll(Duration::from_millis(16))? {
+                loop {
+                    match event::read()? {
+                        Event::Key(k) if k.kind == KeyEventKind::Press => {
+                            match k.code {
+                                KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
+                                KeyCode::Char('c')
+                                    if k.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    return Ok(());
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') => self.app.next_sort(),
+                                KeyCode::Char('v') | KeyCode::Char('V') => self.app.toggle_view(),
+                                KeyCode::Up => self.app.scroll_up(),
+                                KeyCode::Down => self.app.scroll_down(),
+                                KeyCode::PageUp => self.app.page_up(),
+                                KeyCode::PageDown => self.app.page_down(),
+                                _ => {}
+                            }
+                            needs_redraw = true;
+                        }
+                        Event::Resize(_, _) => {
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+
+                    if !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
             }
         }
     }
 }
 
-// REVIEW Maybe consider to log errors instead of printing to stderr
-//        And refactor it to be an standalone method instead of Drop-impl.
-// 
 impl Drop for Tui {
     fn drop(&mut self) {
-        if let Err(err) = disable_raw_mode() {
-            eprintln!("Failed to disable raw mode: {:?}", err);
-        }
-
-        if let Err(err) = execute!(self.terminal.backend_mut(), LeaveAlternateScreen) {
-            eprintln!("Failed to leave alternate screen: {:?}", err);
-        }
-
-        if let Err(err) = self.terminal.show_cursor() {
-            eprintln!("Failed to show cursor: {:?}", err);
-        }
+        ratatui::restore();
     }
 }
