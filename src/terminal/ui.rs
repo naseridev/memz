@@ -1,9 +1,13 @@
-use crate::{
+use crate::core::{
     analyzer::{PressureLevel, signed_diff},
     collector::MemoryBreakdown,
+};
+
+use crate::app::{
     config::THEME_PRESETS,
     state::{App, DisplayRow, SHORTCUT_ITEMS, TABLE_CONSTRAINTS, ViewMode},
 };
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -171,6 +175,7 @@ fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
     let summary_block = Block::default()
         .borders(Borders::ALL)
         .title("System Memory");
+
     frame.render_widget(
         Paragraph::new(summary_lines).block(summary_block),
         columns[0],
@@ -189,6 +194,7 @@ fn draw_system_stats(frame: &mut Frame, area: Rect, app: &App) {
         .data(&sys.history_used_kb)
         .max(sys.total_kb.max(1))
         .style(Style::default().fg(spark_color));
+
     frame.render_widget(sparkline, columns[1]);
 }
 
@@ -213,6 +219,7 @@ fn draw_process_list(frame: &mut Frame, area: Rect, app: &mut App) {
         "Swap",
         delta_header,
     ];
+
     let header_cells = column_titles
         .into_iter()
         .map(|title| Text::from(title).style(header_style));
@@ -291,6 +298,7 @@ fn format_process_table_title(app: &App, leaking_count: usize) -> String {
     } else {
         app.selected_index + 1
     };
+
     let total = app.display_rows.len();
     let sort_label = app.sort_mode.label(app.grouped);
 
@@ -321,6 +329,7 @@ fn draw_shortcuts_modal(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(accent))
         .title(" Shortcuts ");
     let inner = block.inner(area);
+
     frame.render_widget(block, area);
 
     let mut lines = Vec::with_capacity(SHORTCUT_ITEMS.len() + 3);
@@ -381,6 +390,7 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
         .title(title);
+
     let inner_area = outer_block.inner(area);
     frame.render_widget(outer_block, area);
 
@@ -390,7 +400,6 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
         .split(inner_area);
 
     let label_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-
     let status_span = if proc_row.is_leaking {
         Span::styled(
             format!("LEAK (+{} KB/s)", proc_row.leak_rate_kb),
@@ -444,9 +453,11 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
     ];
 
     let pss_base = proc_row.pss_kb.max(1);
+
     for (segment_name, segment_kb, color) in segments {
         let ratio = percentage(segment_kb, pss_base);
         let bar = ascii_bar(ratio, 24);
+
         lines.push(Line::from(vec![
             Span::styled(format!("{segment_name:7} "), Style::default().fg(color)),
             Span::raw(format!("{:7.1}M ({:4.1}%) ", to_mib(segment_kb), ratio)),
@@ -463,11 +474,13 @@ fn draw_inspector_modal(frame: &mut Frame, area: Rect, app: &App) {
         .max()
         .unwrap_or(1)
         .max(1);
+
     let spark_color = if proc_row.is_leaking {
         COLOR_ALERT
     } else {
         accent
     };
+
     let sparkline = Sparkline::default()
         .block(
             Block::default()
@@ -489,6 +502,7 @@ fn draw_color_modal(frame: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
         .title(" Theme Color ");
+
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -547,6 +561,7 @@ fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
     for (label, kb, color) in categories {
         let pct = percentage(kb, total_kb);
         let bar = ascii_bar(pct, 45);
+
         lines.push(Line::from(vec![
             Span::styled(format!("{label:16} "), Style::default().fg(color)),
             Span::raw(format!("{:7.1} GiB ({:5.1}%) ", to_gib(kb), pct)),
@@ -557,8 +572,10 @@ fn draw_memory_map(frame: &mut Frame, area: Rect, app: &App) {
     if !app.state.numa_nodes.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("NUMA Nodes:", header_style)));
+
         for node in &app.state.numa_nodes {
             let used_pct = percentage(node.mem_used_kb, node.mem_total_kb);
+
             lines.push(Line::from(format!(
                 "  Node {}: {:.1} / {:.1} GiB ({:.1}%)",
                 node.node_id,
@@ -602,6 +619,7 @@ fn draw_shared_view(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Shared Memory Analysis");
+
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -630,10 +648,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(":clear", Style::default().fg(COLOR_PRIMARY)),
         ]);
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(COLOR_PRIMARY))
             .title("Filter");
+
         frame.render_widget(Paragraph::new(vec![search_line]).block(block), area);
         return;
     }
@@ -682,6 +702,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLOR_PRIMARY))
         .title("Controls");
+
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]).block(block), area);
 }
 

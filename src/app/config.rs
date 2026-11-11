@@ -1,4 +1,4 @@
-use crate::state::{SortMode, ViewMode};
+use crate::app::state::{SortMode, ViewMode};
 use ratatui::style::Color;
 use std::env;
 use std::fs;

@@ -1,7 +1,7 @@
-use crate::{
+use crate::app::config::{TickMode, UserConfig};
+use crate::core::{
     analyzer::{AnalyzedState, PressureLevel},
     collector::{Collector, MemoryBreakdown},
-    config::{TickMode, UserConfig},
 };
 use anyhow::Result;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -66,6 +66,7 @@ impl Engine {
                         inspected_pids = pids;
                         if !inspected_pids.is_empty() {
                             let _ = inspect_tx.try_send(collector.inspect_pids(&inspected_pids));
+
                             if tick_mode == TickMode::Auto {
                                 current_interval =
                                     current_interval.min(Duration::from_millis(1000));
@@ -142,6 +143,7 @@ fn compute_interval(mode: TickMode, state: &AnalyzedState, inspecting: bool) -> 
         TickMode::Eco => Duration::from_millis(2000),
         TickMode::Auto => {
             let any_leaking = state.processes.iter().any(|p| p.is_leaking);
+
             if state.system.pressure_level != PressureLevel::Healthy || any_leaking {
                 Duration::from_millis(500)
             } else if inspecting {

@@ -1,4 +1,4 @@
-use crate::analyzer::{
+use crate::core::analyzer::{
     AnalyzedState, MAX_HISTORY_SAMPLES, ProcTotals, ProcessStats, RawSystemMemory, build_state,
     detect_leak, signed_diff,
 };
@@ -334,6 +334,7 @@ impl Collector {
             };
 
             let value = val_str.parse::<u64>().unwrap_or(0);
+
             match key {
                 "Rss:" => rollup.rss_kb = value,
                 "Pss:" => rollup.pss_kb = value,

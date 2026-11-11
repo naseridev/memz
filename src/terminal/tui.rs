@@ -1,4 +1,5 @@
-use crate::{engine::Engine, state::App, ui};
+use crate::app::{engine::Engine, state::App};
+use crate::terminal::ui;
 use anyhow::Result;
 use crossterm::{
     event::{
@@ -22,11 +23,14 @@ pub struct Tui {
 impl Tui {
     pub fn new(engine: Engine) -> Result<Self> {
         let mut app = App::new();
+
         if let Some(initial) = engine.try_recv() {
             app.update_data(initial);
         }
+
         let terminal = ratatui::init();
         let _ = execute!(io::stdout(), EnableMouseCapture);
+
         Ok(Self {
             terminal,
             engine,
@@ -80,9 +84,11 @@ impl Tui {
 
         if let Some(state) = self.engine.try_recv() {
             self.app.update_data(state);
+
             if self.app.inspecting {
                 self.engine.inspect_pids(self.app.selected_pids());
             }
+
             updated = true;
         }
 
@@ -443,6 +449,7 @@ impl Tui {
         } else {
             Vec::new()
         };
+
         self.engine.inspect_pids(pids);
     }
 }
@@ -451,6 +458,7 @@ impl Drop for Tui {
     fn drop(&mut self) {
         self.app.save_config();
         let _ = execute!(io::stdout(), DisableMouseCapture);
+
         ratatui::restore();
     }
 }

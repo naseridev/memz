@@ -1,4 +1,4 @@
-use crate::collector::NumaNode;
+use crate::core::collector::NumaNode;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -221,6 +221,7 @@ pub fn detect_leak(history: &VecDeque<u64>, dt_secs: f64) -> (bool, u64) {
     }
 
     let (mut inc, mut dec, mut peak, mut max_drop) = (0usize, 0usize, first, 0u64);
+
     for (&prev, &curr) in history.iter().zip(history.iter().skip(1)) {
         if curr > prev {
             inc += 1;

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use memz::{engine::Engine, tui::Tui};
+use memz::{app::engine::Engine, terminal::tui::Tui};
 
 fn main() -> Result<()> {
     let engine = Engine::new()?;

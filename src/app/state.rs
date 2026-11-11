@@ -1,7 +1,7 @@
-use crate::{
+use crate::app::config::{THEME_PRESETS, ThemePreset, TickMode, UserConfig};
+use crate::core::{
     analyzer::{AnalyzedState, ProcessStats, detect_leak, signed_diff},
     collector::MemoryBreakdown,
-    config::{THEME_PRESETS, ThemePreset, TickMode, UserConfig},
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -324,13 +324,16 @@ impl App {
         if !rect_contains(self.modal_area, column, row) {
             return None;
         }
+
         let first_item_row = self.modal_area.y.saturating_add(2);
+
         if row >= first_item_row {
             let idx = (row - first_item_row) as usize;
             if idx < SHORTCUT_ITEMS.len() {
                 return Some(idx);
             }
         }
+
         None
     }
 
@@ -371,6 +374,7 @@ impl App {
         if !self.is_process_view() {
             return;
         }
+
         self.grouped = !self.grouped;
         self.selected_index = 0;
         self.rebuild_display_rows();
@@ -413,6 +417,7 @@ impl App {
                     .or_insert(0);
                 *group_total = group_total.saturating_add(proc_stat.pss_kb);
             }
+
             self.baseline_system_pss_kb = Some(self.state.system.total_process_pss_kb);
         }
 
@@ -423,6 +428,7 @@ impl App {
         if !self.is_process_view() {
             return Vec::new();
         }
+
         self.display_rows
             .get(self.selected_index)
             .map(|row| row.pids.clone())
@@ -433,6 +439,7 @@ impl App {
         if !self.is_process_view() {
             return;
         }
+
         self.sort_mode = self.sort_mode.next();
         self.selected_index = 0;
         self.rebuild_display_rows();
@@ -452,6 +459,7 @@ impl App {
         if !self.is_process_view() || self.display_rows.is_empty() {
             return;
         }
+
         let max_index = self.display_rows.len().saturating_sub(1);
         let next_index = self
             .selected_index
@@ -479,7 +487,9 @@ impl App {
                 self.close_color_picker();
                 return true;
             }
+
             let first_item_row = self.modal_area.y.saturating_add(2);
+
             if row >= first_item_row {
                 let idx = (row - first_item_row) as usize;
                 if idx < THEME_PRESETS.len() {
@@ -497,6 +507,7 @@ impl App {
                 self.close_inspector();
                 return true;
             }
+
             return false;
         }
 
@@ -505,6 +516,7 @@ impl App {
         }
 
         let header_row = self.table_area.y.saturating_add(1);
+
         if row == header_row {
             return self.handle_header_click(column, header_row);
         }
@@ -560,6 +572,7 @@ impl App {
             self.table_area.width.saturating_sub(2),
             1,
         );
+
         let column_rects = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(TABLE_CONSTRAINTS)
@@ -588,6 +601,7 @@ impl App {
 
         let relative_row = (row - first_data_row) as usize;
         let index = self.table_state.offset().saturating_add(relative_row);
+
         (index < self.display_rows.len()).then_some(index)
     }
 
@@ -608,6 +622,7 @@ impl App {
 
         let sort_mode = self.sort_mode;
         let grouped = self.grouped;
+
         rows.sort_unstable_by(|left, right| compare_rows(left, right, sort_mode, grouped));
 
         self.display_rows = rows;
@@ -626,6 +641,7 @@ impl App {
                 } else {
                     proc_stat.pss_delta_kb
                 };
+
                 DisplayRow::from_process(proc_stat, delta_kb)
             })
             .collect()
@@ -640,6 +656,7 @@ impl App {
             let entry = groups
                 .entry(Arc::clone(&proc_stat.name))
                 .or_insert_with(|| DisplayRow::empty_group_from(proc_stat));
+
             entry.merge_process(proc_stat);
         }
 
@@ -648,6 +665,7 @@ impl App {
                 let base = self.baseline_groups.get(&group.name).copied().unwrap_or(0);
                 group.pss_delta_kb = signed_diff(group.pss_kb, base);
             }
+
             if !group.is_leaking {
                 let history_queue: VecDeque<u64> = group.pss_history.iter().copied().collect();
                 let (is_leaking, leak_rate_kb) = detect_leak(&history_queue, dt_secs);
@@ -735,12 +753,15 @@ fn merge_history(target: &mut Vec<u64>, source: &[u64]) {
     if source.is_empty() {
         return;
     }
+
     if target.len() < source.len() {
         let mut padded = vec![0u64; source.len() - target.len()];
         padded.append(target);
         *target = padded;
     }
+
     let offset = target.len() - source.len();
+
     for (target_val, &source_val) in target.iter_mut().skip(offset).zip(source) {
         *target_val = target_val.saturating_add(source_val);
     }
